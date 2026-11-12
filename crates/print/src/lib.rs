@@ -21,6 +21,7 @@
 use pdfcraft_content::Matrix;
 use pdfcraft_cos::{DecodeBudget, Dict, Document, ObjRef, Object, SaveOptions, Stream, write_full};
 
+pub mod colour;
 mod font_names;
 pub mod driver;
 pub mod duplex;
