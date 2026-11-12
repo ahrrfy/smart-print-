@@ -51,7 +51,7 @@ pub fn spooler_copy(bytes: Vec<u8>, job: &mut crate::print::spool::Job, flatten_
         return bytes;
     }
     let mut bytes = Arc::new(bytes);
-    if job.grayscale {
+    if job.grayscale && !job.grey_pages {
         match greyed(bytes.clone()) {
             Some(Some(grey)) => {
                 bytes = Arc::new(grey);

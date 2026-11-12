@@ -120,6 +120,48 @@ pub struct PrintDraft {
     /// The paper, sizing and two-sided choice each printer was last printed with, the printer
     /// printed to last first; kept across restarts (#2001).
     pub setups: Vec<(String, PrinterSetup)>,
+
+    // --- Milestone 4 Production Print Studio Extensions ---
+    /// Enable multi-printer simultaneous batch dispatch.
+    pub multi_printer_mode: bool,
+    /// The set of chosen printers when in multi-printer mode.
+    pub selected_printers: std::collections::BTreeSet<String>,
+    /// Which printer's hardware printable area and margins are being previewed.
+    pub active_preview_printer: Option<String>,
+    /// Job presets and printer groups store.
+    pub preset_store: crate::workflows::print_presets::PrintPresetStore,
+    /// Physical hardware margins of the active preview printer (in points: [left, top, right, bottom]).
+    pub preview_hardware_margins: Option<[f64; 4]>,
+    /// Printable area of the active preview printer (width, height in points).
+    pub preview_printable_area: Option<(f64, f64)>,
+    /// Active clipping hazard detected (overflow amounts: [left, top, right, bottom] in points).
+    pub clipping_hazard: Option<[f64; 4]>,
+    /// Active failover modal dialog state, if any.
+    pub failover_modal: Option<FailoverModalState>,
+    /// Pending failover reroute request: (from_printer, to_printer).
+    pub pending_failover: Option<(String, String)>,
+    /// Printer whose physical hardware capabilities (margins, DPI, duplex, generation) should be queried off the UI thread.
+    pub read_caps_for: Option<String>,
+    /// Cached hardware capabilities per printer for pre-flight checks, margin preview, and diagnostic export.
+    pub cached_capabilities: std::collections::BTreeMap<String, pdfcraft_platform::diagnostics::PrinterCapabilitiesTelemetry>,
+    /// Recent execution traces (dispatch, stalls, hardware faults, failovers) for one-click diagnostic export.
+    pub diagnostic_traces: Vec<pdfcraft_platform::diagnostics::TraceRecord>,
+    /// Optional inline input when saving selected cluster printers as a reusable group.
+    pub new_group_name: Option<String>,
+    /// Optional inline input when saving current settings as a reusable job preset.
+    pub new_preset_name: Option<String>,
+}
+
+/// State for the One-Click Print Failover modal dialog.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FailoverModalState {
+    pub from_printer: String,
+    pub to_printer: String,
+    pub failed_sheet: usize,
+    pub committed_sheets: usize,
+    pub pending_sheets: usize,
+    pub total_sheets: usize,
+    pub error_message: String,
 }
 
 impl Default for PrintDraft {
@@ -181,7 +223,193 @@ impl Default for PrintDraft {
             read_papers_for: None,
             two_sided: Default::default(),
             setups: Vec::new(),
+            multi_printer_mode: false,
+            selected_printers: std::collections::BTreeSet::new(),
+            active_preview_printer: None,
+            preset_store: crate::workflows::print_presets::PrintPresetStore::with_defaults(),
+            preview_hardware_margins: None,
+            preview_printable_area: None,
+            clipping_hazard: None,
+            failover_modal: None,
+            pending_failover: None,
+            read_caps_for: None,
+            cached_capabilities: std::collections::BTreeMap::new(),
+            diagnostic_traces: Vec::new(),
+            new_group_name: None,
+            new_preset_name: None,
         }
+    }
+}
+
+impl PrintDraft {
+    /// Appends a diagnostic trace record, capping the buffer at 250 entries.
+    pub fn push_trace(&mut self, record: pdfcraft_platform::diagnostics::TraceRecord) {
+        if self.diagnostic_traces.len() >= 250 {
+            self.diagnostic_traces.remove(0);
+        }
+        self.diagnostic_traces.push(record);
+    }
+
+    /// Stores queried hardware capabilities for `printer_name`, updating live preview margins
+    /// when `printer_name` matches the active preview or primary selected printer.
+    pub fn apply_capabilities_telemetry(
+        &mut self,
+        printer_name: String,
+        mut caps: pdfcraft_platform::diagnostics::PrinterCapabilitiesTelemetry,
+    ) {
+        if let Some(listed) = self.printers.iter().find(|p| p.name == printer_name) {
+            caps.is_default = listed.default;
+        }
+        caps.supported_paper_count = self.papers.len();
+        self.two_sided
+            .entry(printer_name.clone())
+            .or_insert(Some(caps.is_duplex_supported));
+
+        let preview_target = if self.multi_printer_mode {
+            self.active_preview_printer
+                .as_deref()
+                .or(self.printer.as_deref())
+        } else {
+            self.printer.as_deref()
+        };
+        if preview_target == Some(printer_name.as_str()) {
+            self.preview_hardware_margins = Some([
+                caps.hardware_margins_pt.left,
+                caps.hardware_margins_pt.top,
+                caps.hardware_margins_pt.right,
+                caps.hardware_margins_pt.bottom,
+            ]);
+            self.preview_printable_area =
+                Some((caps.printable_area_pt.width, caps.printable_area_pt.height));
+        }
+        self.cached_capabilities.insert(printer_name, caps);
+    }
+
+    /// Creates a `PrintJobPreset` snapshot from the current dialog choices.
+    pub fn snapshot_as_preset(&self, id: String, name: String) -> crate::workflows::print_presets::PrintJobPreset {
+        let color_mode = if self.grayscale {
+            crate::workflows::print_presets::PresetColorMode::Monochrome
+        } else {
+            crate::workflows::print_presets::PresetColorMode::Color
+        };
+        let duplex = match self.duplex {
+            Some(spool::Duplex::LongEdge) => crate::workflows::print_presets::PresetDuplex::LongEdge,
+            Some(spool::Duplex::ShortEdge) => crate::workflows::print_presets::PresetDuplex::ShortEdge,
+            _ => crate::workflows::print_presets::PresetDuplex::Simplex,
+        };
+        let orientation = match self.orientation {
+            Orientation::Portrait => crate::workflows::print_presets::PresetOrientation::Portrait,
+            Orientation::Landscape => crate::workflows::print_presets::PresetOrientation::Landscape,
+            Orientation::Auto => crate::workflows::print_presets::PresetOrientation::Auto,
+        };
+        let fit_mode = match self.size {
+            SizeMode::Fit => crate::workflows::print_presets::PresetFitMode::FitToPrintable,
+            SizeMode::Actual => crate::workflows::print_presets::PresetFitMode::ActualSize100,
+            SizeMode::Shrink => crate::workflows::print_presets::PresetFitMode::ShrinkOversized,
+            SizeMode::Custom(_) => crate::workflows::print_presets::PresetFitMode::CustomScale(self.custom_scale as f32),
+        };
+        crate::workflows::print_presets::PrintJobPreset {
+            id,
+            name,
+            description: "User-saved print preset".to_string(),
+            is_built_in: false,
+            copies: self.copies.max(1),
+            color_mode,
+            duplex,
+            orientation,
+            fit_mode,
+            custom_scale_pct: matches!(self.size, SizeMode::Custom(_)).then_some(self.custom_scale as f32),
+            collate: self.collate,
+        }
+    }
+    /// Applies a saved job preset to the current draft configuration.
+    pub fn apply_preset(&mut self, preset: &crate::workflows::print_presets::PrintJobPreset) {
+        self.copies = preset.copies;
+        self.collate = preset.collate;
+        self.grayscale = matches!(preset.color_mode, crate::workflows::print_presets::PresetColorMode::Monochrome);
+        self.duplex = match preset.duplex {
+            crate::workflows::print_presets::PresetDuplex::Simplex => Some(spool::Duplex::Off),
+            crate::workflows::print_presets::PresetDuplex::LongEdge => Some(spool::Duplex::LongEdge),
+            crate::workflows::print_presets::PresetDuplex::ShortEdge => Some(spool::Duplex::ShortEdge),
+        };
+        self.orientation = match preset.orientation {
+            crate::workflows::print_presets::PresetOrientation::Auto => Orientation::Auto,
+            crate::workflows::print_presets::PresetOrientation::Portrait => Orientation::Portrait,
+            crate::workflows::print_presets::PresetOrientation::Landscape => Orientation::Landscape,
+        };
+        match &preset.fit_mode {
+            crate::workflows::print_presets::PresetFitMode::FitToPrintable => {
+                self.handling = Handling::Size;
+                self.size = SizeMode::Fit;
+            }
+            crate::workflows::print_presets::PresetFitMode::ActualSize100 => {
+                self.handling = Handling::Size;
+                self.size = SizeMode::Actual;
+                self.custom_scale = 100.0;
+            }
+            crate::workflows::print_presets::PresetFitMode::ShrinkOversized => {
+                self.handling = Handling::Size;
+                self.size = SizeMode::Shrink;
+            }
+            crate::workflows::print_presets::PresetFitMode::CustomScale(s) => {
+                self.handling = Handling::Size;
+                self.size = SizeMode::Custom(*s as f64);
+                self.custom_scale = *s as f64;
+            }
+        }
+        if let Some(s) = preset.custom_scale_pct {
+            self.custom_scale = s as f64;
+            if matches!(self.size, SizeMode::Custom(_)) {
+                self.size = SizeMode::Custom(s as f64);
+            }
+        }
+    }
+
+    /// Selects all printers associated with a named printer group.
+    pub fn select_printer_group(&mut self, group_id: &str) {
+        if let Some(group) = self.preset_store.get_group(group_id) {
+            self.selected_printers = group.printer_names.clone();
+            if self.active_preview_printer.is_none() {
+                self.active_preview_printer = self.selected_printers.iter().next().cloned();
+            }
+        }
+    }
+
+    /// Evaluates if content bounds extend outside the printable area.
+    /// Bounds are `[x0, y0, x1, y1]` in sheet coordinates.
+    pub fn detect_clipping_hazard(&mut self, sheet_size: (f64, f64), placed_bounds: [f64; 4]) -> bool {
+        let Some(margins) = self.preview_hardware_margins else {
+            self.clipping_hazard = None;
+            return false;
+        };
+
+        let [left, top, right, bottom] = margins;
+        let printable_x0 = left;
+        let printable_y0 = bottom;
+        let printable_x1 = sheet_size.0 - right;
+        let printable_y1 = sheet_size.1 - top;
+
+        let [bx0, by0, bx1, by1] = placed_bounds;
+
+        let ov_left = (printable_x0 - bx0).max(0.0);
+        let ov_bottom = (printable_y0 - by0).max(0.0);
+        let ov_right = (bx1 - printable_x1).max(0.0);
+        let ov_top = (by1 - printable_y1).max(0.0);
+
+        if ov_left > 0.5 || ov_bottom > 0.5 || ov_right > 0.5 || ov_top > 0.5 {
+            self.clipping_hazard = Some([ov_left, ov_top, ov_right, ov_bottom]);
+            true
+        } else {
+            self.clipping_hazard = None;
+            false
+        }
+    }
+
+    /// Automatically sets sizing to fit within the printable area, resolving clipping.
+    pub fn auto_fit_to_printable(&mut self) {
+        self.handling = Handling::Size;
+        self.size = SizeMode::Fit;
+        self.clipping_hazard = None;
     }
 }
 
@@ -517,6 +745,22 @@ impl PrintDraft {
         self.handling == Handling::Multiple && self.order == PageOrder::CutStack
     }
 
+    /// Whether `printer_name`'s driver accepts two-sided settings from external applications.
+    pub fn printer_two_sided_for(&self, printer_name: &str) -> Option<bool> {
+        let from_list = self
+            .printers
+            .iter()
+            .find(|p| p.name == printer_name)
+            .and_then(|p| p.two_sided);
+        from_list
+            .or_else(|| self.two_sided.get(printer_name).copied().flatten())
+            .or_else(|| {
+                self.cached_capabilities
+                    .get(printer_name)
+                    .map(|c| c.is_duplex_supported)
+            })
+    }
+
     /// Whether the chosen printer's driver takes two-sided settings from other programs:
     /// `Some(false)` for one that keeps its own (no two-sided printing, or only manual two-sided in
     /// its Properties); `None` when unknown, and for Save as PDF. The printer list says when it
@@ -524,7 +768,16 @@ impl PrintDraft {
     /// for the printer picked arrives in [`PrintDraft::two_sided`].
     pub fn printer_two_sided(&self) -> Option<bool> {
         let p = self.printers.iter().find(|p| self.printer.as_ref() == Some(&p.name))?;
-        p.two_sided.or_else(|| self.two_sided.get(&p.name).copied().flatten())
+        self.printer_two_sided_for(&p.name)
+    }
+
+    /// The Two-sided choice adapted for a specific printer (`printer_name`), or for Save as PDF (`None`).
+    fn chosen_duplex_for(&self, printer_name: Option<&str>) -> Option<spool::Duplex> {
+        let two_sided = printer_name.and_then(|name| self.printer_two_sided_for(name));
+        match self.duplex {
+            Some(spool::Duplex::LongEdge | spool::Duplex::ShortEdge) if two_sided == Some(false) => None,
+            chosen => chosen,
+        }
     }
 
     /// The Two-sided choice as the chosen printer can take it: long or short edge is left out for
@@ -532,17 +785,25 @@ impl PrintDraft {
     /// setting applies instead of the job being refused (#3208). Off and the printer's default
     /// stay as chosen: one-sided is accepted by every driver.
     fn chosen_duplex(&self) -> Option<spool::Duplex> {
-        match self.duplex {
-            Some(spool::Duplex::LongEdge | spool::Duplex::ShortEdge) if self.printer_two_sided() == Some(false) => None,
-            chosen => chosen,
+        self.chosen_duplex_for(self.printer.as_deref())
+    }
+
+    /// Returns the list of target printers for the current mode (cluster selection in multi-printer mode,
+    /// or the single chosen printer otherwise).
+    pub fn target_printers(&self) -> Vec<String> {
+        if self.multi_printer_mode {
+            self.selected_printers.iter().cloned().collect()
+        } else {
+            self.printer.iter().cloned().collect()
         }
     }
 
-    /// The spooler job for this print: the dialog's copies, two-sided and colour settings, the
-    /// driver options changed from the printer's defaults, and the chosen paper.
-    pub fn job(&self, title: &str) -> spool::Job {
+    /// Builds the unified spooler job tailored to `target_printer` (applying unified copies, collate,
+    /// grayscale, paper media keyword, and per-printer duplex capability safety).
+    pub fn job_for_printer(&self, target_printer: Option<&str>, title: &str) -> spool::Job {
+        let two_sided = target_printer.and_then(|name| self.printer_two_sided_for(name));
         spool::Job {
-            printer: self.printer.clone(),
+            printer: target_printer.map(str::to_owned),
             copies: self.copies.max(1),
             collate: self.collate,
             // Cut and stack needs single-sided sheets, whatever the printer's default; a booklet
@@ -551,9 +812,9 @@ impl PrintDraft {
             duplex: if self.cut_and_stack() {
                 Some(spool::Duplex::Off)
             } else if self.handling == Handling::Booklet {
-                print::booklet_job_duplex(self.booklet_subset, self.printer_two_sided())
+                print::booklet_job_duplex(self.booklet_subset, two_sided)
             } else {
-                self.chosen_duplex()
+                self.chosen_duplex_for(target_printer)
             },
             scaling: spool::Scaling::Exact,
             grayscale: print::driver_needs_grayscale(self.grayscale, self.raster()),
@@ -561,15 +822,26 @@ impl PrintDraft {
             grey_pages: false,
             title: title.to_string(),
             // Only for the printer the options were read from.
-            options: match (&self.printer, &self.driver_options) {
-                (Some(p), Some((read_for, _))) if p == read_for => self.driver_choices.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            options: match (target_printer, &self.driver_options) {
+                (Some(p), Some((read_for, _))) if p == read_for => {
+                    self.driver_choices.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                }
                 _ => Vec::new(),
             }
             .into_iter()
             // The sheet the PDF was laid out on, not the queue's default paper.
             // A user's custom label is not a keyword from the driver's media catalog.
-            .chain(Some(print::paper_media_option((!self.paper_is_custom()).then(|| self.paper_name()).as_deref(), self.paper_size())))
+            .chain(Some(print::paper_media_option(
+                (!self.paper_is_custom()).then(|| self.paper_name()).as_deref(),
+                self.paper_size(),
+            )))
             .collect(),
         }
+    }
+
+    /// The spooler job for this print: the dialog's copies, two-sided and colour settings, the
+    /// driver options changed from the printer's defaults, and the chosen paper.
+    pub fn job(&self, title: &str) -> spool::Job {
+        self.job_for_printer(self.printer.as_deref(), title)
     }
 }

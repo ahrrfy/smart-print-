@@ -344,6 +344,29 @@ impl Document {
         pdfcraft_create::image_file(&editor.cos, img.object.ok_or("the image has no object")?)
     }
 
+    /// Creates a zero-copy shared memory snapshot of the document for concurrent workers.
+    ///
+    /// If the document is unmodified (`!self.dirty`) and exists on disk (`self.path.is_some()`),
+    /// this attempts to memory-map the file via OS virtual memory (`SharedPdfSource::Mmap`).
+    /// If the document has unsaved edits, has no disk path, or if memory-mapping fails,
+    /// it wraps the in-memory buffer (`SharedPdfSource::Heap`) with zero memory copies
+    /// by cloning the internal `Arc`.
+    pub fn snapshot(&self) -> crate::snapshot::SharedPdfSource {
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.dirty
+            && let Some(path) = &self.path
+            && let Ok(source) = crate::snapshot::SharedPdfSource::from_file(path)
+        {
+            return source;
+        }
+        crate::snapshot::SharedPdfSource::from_arc(self.bytes.clone())
+    }
+
+    /// Creates a shared snapshot specifically from the display buffer (including dynamic appearances).
+    pub fn display_snapshot(&self) -> crate::snapshot::SharedPdfSource {
+        crate::snapshot::SharedPdfSource::from_arc(self.display.clone())
+    }
+
     /// Edit text: whether grouped artwork `index` on `page` (0-based, as [`Self::page_images`]
     /// lists them) shows text that [`Edit::PrepareText`](crate::Edit::PrepareText) would make
     /// editable. Reads the page without changing it; `false` for a logo, a group that can't be

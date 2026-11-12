@@ -5,14 +5,36 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+cognitive_complexity = "deny"
+too_many_arguments = "deny"
+wildcard_imports = "deny"
+dbg_macro = "warn"
+todo = "warn"
 
 [dependencies]
+chrono = { workspace = true, features = ["clock", "serde"] }
 log = { workspace = true }
+pdfcraft-print = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# `write_atomically`: a volume that refuses F_FULLFSYNC gets a plain fsync.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Printing",
+    "Win32_Storage_Xps",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+] }
+winreg = "0.55"
+
+[target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

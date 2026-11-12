@@ -390,7 +390,7 @@ thread_local! {
 }
 
 /// The source document's pages, for printing.
-fn source_pages(doc: &Document) -> Vec<pdfcraft_model::Page> {
+pub(crate) fn source_pages(doc: &Document) -> Vec<pdfcraft_model::Page> {
     let pages = pdfcraft_model::pages(doc);
     #[cfg(test)]
     PAGES_LISTED.with(|c| c.set(c.get() + pages.len()));
@@ -496,4 +496,99 @@ pub fn impose(src: &Document, settings: &Settings) -> Result<Vec<u8>, PrintError
 /// Which source pages land on each sheet (for previews and the sheet count).
 pub fn sheet_pages(sheets: &[Sheet]) -> Vec<Vec<usize>> {
     sheets.iter().map(|s| s.placed.iter().map(|p| p.page).collect()).collect()
+}
+
+/// Builds a self-contained 1-sheet print-ready PDF containing only `sheet`.
+pub fn impose_single_sheet(
+    src: &Document,
+    pages: &[pdfcraft_model::Page],
+    sheet: &Sheet,
+    settings: &Settings,
+) -> Result<Vec<u8>, PrintError> {
+    let mut doc = src.clone();
+    let mut forms: std::collections::HashMap<usize, ObjRef> = std::collections::HashMap::new();
+    let mut promoted = std::collections::HashMap::new();
+    let views: Vec<[f64; 6]> = pages.iter().map(|p| p.view_matrix(src)).collect();
+    let pages_root = doc.add(Object::Null);
+
+    let mut c = String::new();
+    let mut xo = Dict::new();
+    for (i, pl) in sheet.placed.iter().enumerate() {
+        let form = match forms.get(&pl.page) {
+            Some(f) => *f,
+            None => {
+                let f = page_form(&mut doc, pages, pl.page, settings.content, &mut promoted)?;
+                forms.insert(pl.page, f);
+                f
+            }
+        };
+        let name = format!("P{i}");
+        xo.set(name.clone().into_bytes(), Object::Ref(form));
+        // Display space → sheet, then clip to the visible part, then user → display.
+        let [a, b, cc, d, e, f] = pl.matrix.0;
+        let to_display = Matrix(views[pl.page]).invert().unwrap_or_default();
+        let [ua, ub, uc, ud, ue, uf] = to_display.0;
+        let [x0, y0, x1, y1] = pl.clip;
+        c.push_str(&format!(
+            "q {} {} {} {} {} {} cm {} {} {} {} re W n {} {} {} {} {} {} cm /{name} Do Q\n",
+            geometry_number(a),
+            geometry_number(b),
+            geometry_number(cc),
+            geometry_number(d),
+            geometry_number(e),
+            geometry_number(f),
+            geometry_number(x0),
+            geometry_number(y0),
+            geometry_number(x1 - x0),
+            geometry_number(y1 - y0),
+            geometry_number(ua),
+            geometry_number(ub),
+            geometry_number(uc),
+            geometry_number(ud),
+            geometry_number(ue),
+            geometry_number(uf)
+        ));
+    }
+    if !sheet.borders.is_empty() || !sheet.lines.is_empty() {
+        c.push_str("q 0 G 0.5 w\n");
+        for r in &sheet.borders {
+            c.push_str(&format!("{} {} {} {} re S\n", n(r[0]), n(r[1]), n(r[2] - r[0]), n(r[3] - r[1])));
+        }
+        for l in &sheet.lines {
+            c.push_str(&format!("{} {} m {} {} l S\n", n(l[0]), n(l[1]), n(l[2]), n(l[3])));
+        }
+        c.push_str("Q\n");
+    }
+    let contents = doc.add(Object::Stream(Stream::flate(Dict::new(), c.as_bytes())));
+    let mut res = Dict::new();
+    res.set(b"XObject".to_vec(), Object::Dict(xo));
+    let mut p = Dict::new();
+    p.set(b"Type".to_vec(), Object::name("Page"));
+    p.set(b"Parent".to_vec(), Object::Ref(pages_root));
+    p.set(b"MediaBox".to_vec(), Object::Array([0.0, 0.0, sheet.size.0, sheet.size.1].iter().map(|v| Object::Real(*v)).collect()));
+    p.set(b"Resources".to_vec(), Object::Dict(res));
+    p.set(b"Contents".to_vec(), Object::Ref(contents));
+    let page_ref = doc.add(Object::Dict(p));
+
+    let mut tree = Dict::new();
+    tree.set(b"Type".to_vec(), Object::name("Pages"));
+    tree.set(b"Count".to_vec(), Object::Int(1));
+    tree.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(page_ref)]));
+    doc.set(pages_root, Object::Dict(tree));
+
+    let mut cat = Dict::new();
+    cat.set(b"Type".to_vec(), Object::name("Catalog"));
+    cat.set(b"Pages".to_vec(), Object::Ref(pages_root));
+
+    let layers = src.trailer().get(b"Root").and_then(|r| src.resolve(r).as_dict().and_then(|root| root.get(b"OCProperties").cloned()));
+    if let Some(layers) = layers {
+        cat.set(b"OCProperties".to_vec(), layers);
+    }
+    let root = doc.add(Object::Dict(cat));
+    doc.trailer_mut().set(b"Root".to_vec(), Object::Ref(root));
+    doc.trailer_mut().remove(b"Info");
+    if doc.trailer().contains(b"Encrypt") {
+        doc.remove_encryption();
+    }
+    Ok(write_full(&doc, &SaveOptions::default())?)
 }

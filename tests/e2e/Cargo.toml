@@ -1,0 +1,58 @@
+[package]
+name = "pdfcraft-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "pdfcraft_e2e"
+path = "harness/mod.rs"
+
+[dependencies]
+pdfcraft-cos = { workspace = true }
+pdfcraft-testkit = { workspace = true }
+pdfcraft-print = { workspace = true }
+pdfcraft-platform = { workspace = true }
+pdfcraft-content = { workspace = true }
+memmap2 = "0.9"
+serde = { workspace = true }
+serde_json = { workspace = true }
+flate2 = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+chrono = { workspace = true }
+tempfile = "3.27"
+
+[[test]]
+name = "harness_verification"
+path = "tests/harness_verification.rs"
+
+[[test]]
+name = "adversarial_challenge"
+path = "tests/adversarial_challenge.rs"
+
+[[test]]
+name = "adversarial_tm0_2"
+path = "tests/adversarial_tm0_2.rs"
+
+[[test]]
+name = "tier1_features"
+path = "tests/tier1_features.rs"
+
+[[test]]
+name = "tier2_boundaries"
+path = "tests/tier2_boundaries.rs"
+
+[[test]]
+name = "tier3_combinations"
+path = "tests/tier3_combinations.rs"
+
+[[test]]
+name = "tier4_scenarios"
+path = "tests/tier4_scenarios.rs"
+
+[[test]]
+name = "tier5_adversarial"
+path = "tests/tier5_adversarial.rs"
+
+

@@ -13,6 +13,7 @@ craft-print = { workspace = true }
 log = { workspace = true }
 pdfcraft-cos = { workspace = true }
 pdfcraft-content = { workspace = true }
+pdfcraft-filters = { workspace = true }
 pdfcraft-model = { workspace = true }
 thiserror = { workspace = true }
 

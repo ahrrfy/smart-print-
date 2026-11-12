@@ -199,6 +199,9 @@ impl PdfCraftApp {
         v["print"] = print;
         // Each printer's paper, sizing and two-sided choice, the one printed to last first (#2001).
         v["print_printers"] = crate::print_ui::setups_to_json(&self.print_draft.setups);
+        v["print_presets"] = serde_json::to_value(&self.print_draft.preset_store).unwrap_or_default();
+        v["print_multi_mode"] = serde_json::Value::Bool(self.print_draft.multi_printer_mode);
+        v["print_selected_printers"] = serde_json::to_value(&self.print_draft.selected_printers).unwrap_or_default();
         v.to_string()
     }
 
@@ -344,6 +347,28 @@ impl PdfCraftApp {
         }
         if let Some(setups) = crate::print_ui::setups_from_json(&v["print_printers"]) {
             self.print_draft.setups = setups;
+        }
+        if let Some(presets_val) = v.get("print_presets")
+            && let Ok(restored_store) = serde_json::from_value::<crate::workflows::print_presets::PrintPresetStore>(presets_val.clone())
+        {
+            let mut merged = crate::workflows::print_presets::PrintPresetStore::with_defaults();
+            for (k, p) in restored_store.presets {
+                if !p.is_built_in {
+                    merged.presets.insert(k, p);
+                }
+            }
+            merged.groups = restored_store.groups;
+            merged.active_preset_id = restored_store.active_preset_id.filter(|id| merged.presets.contains_key(id));
+            merged.active_group_id = restored_store.active_group_id.filter(|id| merged.groups.contains_key(id));
+            self.print_draft.preset_store = merged;
+        }
+        if let Some(multi) = v.get("print_multi_mode").and_then(serde_json::Value::as_bool) {
+            self.print_draft.multi_printer_mode = multi;
+        }
+        if let Some(sel_val) = v.get("print_selected_printers")
+            && let Ok(sel) = serde_json::from_value::<std::collections::BTreeSet<String>>(sel_val.clone())
+        {
+            self.print_draft.selected_printers = sel;
         }
         // The Print dialog's remembered choices (#2001). Settings are untrusted: an unknown name
         // or a scale outside the dialog's range keeps the default. The scale is read before the

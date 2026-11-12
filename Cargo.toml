@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "apps/*", "xtask"]
+members = ["crates/*", "apps/*", "xtask", "tests/e2e"]
 exclude = ["vendor"]
 default-members = ["crates/*", "apps/pdfcraft", "apps/pdfcraft-cli", "xtask"]
 
@@ -85,6 +85,7 @@ hayro-ccitt = "0.3"
 hayro-jbig2 = "0.3"
 
 # foundation
+memmap2 = "0.9"
 thiserror = "2"
 zeroize = "1"
 # Linear-time matching (no backtracking) for caller-supplied redaction patterns. `perf-dfa` gives

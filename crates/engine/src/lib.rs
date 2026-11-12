@@ -45,6 +45,7 @@ pub mod open_parameters;
 pub mod optimizer;
 mod page_filter;
 mod pictures;
+pub mod print_coordinator;
 pub mod print_raster;
 pub mod printcheck;
 mod protection;
@@ -57,6 +58,8 @@ pub mod signature_image;
 pub mod signature_scan;
 mod sources;
 pub mod spooler;
+pub mod snapshot;
+pub use snapshot::{SharedPdfSource, SnapshotError};
 mod stamp_preview;
 #[cfg(test)]
 mod test_hooks;
@@ -134,6 +137,11 @@ pub use pdfcraft_forms::detect;
 pub use pdfcraft_optimize as optimize;
 pub use pdfcraft_preflight as pdfa;
 pub use pdfcraft_print as print;
+pub use print_coordinator::{
+    CancellationToken, CommittedSheetsLedger, CoordinatorCommand, CoordinatorEvent,
+    FailoverError, MultiJobHandle, PrintCoordinatorError, PrintOrchestrationCoordinator,
+    PrinterStreamTelemetry, StreamHealth,
+};
 pub use pdfcraft_redact::Elsewhere as RedactionElsewhere;
 pub use pdfcraft_redact::codes::{CODE_SETS as REDACTION_CODE_SETS, CodeSet as RedactionCodeSet};
 pub use pdfcraft_redact::patterns::{

@@ -141,6 +141,16 @@ pub(crate) fn body(
         ui.vertical(|ui| {
             ui.set_width(470.0);
             egui::Grid::new("print-top").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                // Milestone 4: Job Preset & Diagnostic Buttons Row
+                ui.label(tl!("Job Preset:"));
+                preset_and_diagnostics_row(ui, d);
+                ui.end_row();
+                if d.new_preset_name.is_some() {
+                    ui.label("");
+                    save_preset_inline_row(ui, d);
+                    ui.end_row();
+                }
+
                 let printer_caption = ui.label(tl!("Printer:"));
                 let before = d.printer.clone();
                 // The browser's print dialog sets copies, two-sided printing and colour itself.
@@ -204,10 +214,31 @@ pub(crate) fn body(
                     d.reset_unoverridden_custom_paper();
                     d.apply_printer_papers(Vec::new());
                     if let Some(p) = d.printer.clone() {
-                        d.read_papers_for = Some(p);
+                        d.read_papers_for = Some(p.clone());
+                        d.read_caps_for = Some(p);
+                    } else {
+                        d.preview_hardware_margins = None;
+                        d.preview_printable_area = None;
                     }
                 }
                 ui.end_row();
+
+                // Milestone 4: Multi-Printer Mode Toggle & Cluster Selector
+                ui.label(tl!("Cluster Mode:"));
+                cluster_mode_header_row(ui, d);
+                ui.end_row();
+                if d.new_group_name.is_some() {
+                    ui.label("");
+                    save_group_inline_row(ui, d);
+                    ui.end_row();
+                }
+
+                if d.multi_printer_mode {
+                    ui.label(tl!("Target Printers:"));
+                    cluster_printers_panel(ui, d, t);
+                    ui.end_row();
+                }
+
                 // The spooler answered with no printer at all (#160): say so, rather than
                 // leaving Save as PDF looking like the only thing PdfCraft can do.
                 if !d.printers_loading && d.printers.is_empty() {
@@ -604,7 +635,48 @@ pub(crate) fn body(
                     let k = (PREVIEW_BOX.0 / sheet.size.0 as f32).min(PREVIEW_BOX.1 / sheet.size.1 as f32);
                     let paper = Rect::from_center_size(area.center(), vec2(sheet.size.0 as f32 * k, sheet.size.1 as f32 * k));
                     ui.painter().rect_filled(paper, 0.0, Color32::WHITE);
-                    ui.painter().rect_stroke(paper, 0.0, Stroke::new(1.0, t.border), egui::StrokeKind::Outside);
+
+                    // Milestone 4: Draw Hardware Margins (Shaded Unprintable Strips) & Printable Bounds
+                    if let Some([m_left, m_top, m_right, m_bottom]) = d.preview_hardware_margins {
+                        let strip_color = Color32::from_rgba_unmultiplied(215, 220, 230, 100);
+                        let left_strip = Rect::from_min_max(paper.left_top(), pos2(paper.left() + m_left as f32 * k, paper.bottom()));
+                        ui.painter().rect_filled(left_strip, 0.0, strip_color);
+                        let right_strip = Rect::from_min_max(pos2(paper.right() - m_right as f32 * k, paper.top()), paper.right_bottom());
+                        ui.painter().rect_filled(right_strip, 0.0, strip_color);
+                        let top_strip = Rect::from_min_max(paper.left_top(), pos2(paper.right(), paper.top() + m_top as f32 * k));
+                        ui.painter().rect_filled(top_strip, 0.0, strip_color);
+                        let bottom_strip = Rect::from_min_max(pos2(paper.left(), paper.bottom() - m_bottom as f32 * k), paper.right_bottom());
+                        ui.painter().rect_filled(bottom_strip, 0.0, strip_color);
+
+                        let printable = Rect::from_min_max(
+                            pos2(paper.left() + m_left as f32 * k, paper.top() + m_top as f32 * k),
+                            pos2(paper.right() - m_right as f32 * k, paper.bottom() - m_bottom as f32 * k),
+                        );
+                        ui.painter().rect_stroke(printable, 0.0, Stroke::new(1.0, Color32::from_rgb(70, 130, 230)), egui::StrokeKind::Inside);
+                    }
+
+                    // Milestone 4: Clipping Hazard Detection
+                    let mut has_clipping = false;
+                    if let Some([m_left, m_top, m_right, m_bottom]) = d.preview_hardware_margins {
+                        for pl in &sheet.placed {
+                            let [x0, y0, x1, y1] = pl.clip;
+                            let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| pl.matrix.apply(x, y));
+                            for (cx, cy) in corners {
+                                if cx < m_left - 0.5 || cx > (sheet.size.0 - m_right) + 0.5 || cy < m_bottom - 0.5 || cy > (sheet.size.1 - m_top) + 0.5 {
+                                    has_clipping = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if has_clipping {
+                        d.clipping_hazard = Some([1.0, 1.0, 1.0, 1.0]);
+                        let pulse = 160 + ((ui.input(|i| i.time * 4.0).sin() * 70.0) as u8);
+                        ui.painter().rect_stroke(paper, 0.0, Stroke::new(2.5, Color32::from_rgba_unmultiplied(235, 45, 35, pulse)), egui::StrokeKind::Outside);
+                    } else {
+                        d.clipping_hazard = None;
+                        ui.painter().rect_stroke(paper, 0.0, Stroke::new(1.0, t.border), egui::StrokeKind::Outside);
+                    }
                     let to_screen = |x: f64, y: f64| -> Pos2 { pos2(paper.left() + x as f32 * k, paper.bottom() - y as f32 * k) };
                     let painter = ui.painter().with_clip_rect(paper);
                     for pl in &sheet.placed {
@@ -688,6 +760,17 @@ pub(crate) fn body(
                     }
                 }
             }
+
+            // Milestone 4: Clipping Hazard Banner & Auto-Fit Action
+            if d.clipping_hazard.is_some() {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("⚠️ Clipping hazard: content extends beyond printable area").color(Color32::from_rgb(225, 45, 35)).small());
+                    if ui.small_button(tl!("Auto-Fit to Printable Area")).clicked() {
+                        d.auto_fit_to_printable();
+                    }
+                });
+            }
         });
     });
     }); // end ScrollArea (#4252, #5317)
@@ -696,9 +779,17 @@ pub(crate) fn body(
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         let looking = still_looking(d);
         let waiting_paper = d.papers_loading();
-        let label = if d.printer.is_some() || looking { tl!("Print") } else { tl!("Save as PDF") };
+        let has_cluster_targets = !d.multi_printer_mode || !d.selected_printers.is_empty();
+        let label = if d.multi_printer_mode || d.printer.is_some() || looking {
+            tl!("Print")
+        } else {
+            tl!("Save as PDF")
+        };
         if ui
-            .add_enabled_ui(settings.is_ok() && !sheets.is_empty() && !looking && !waiting_paper, |ui| widgets::pill_button(ui, label, true))
+            .add_enabled_ui(
+                settings.is_ok() && !sheets.is_empty() && !looking && !waiting_paper && has_cluster_targets,
+                |ui| widgets::pill_button(ui, label, true),
+            )
             .inner
             .clicked()
         {
@@ -708,7 +799,336 @@ pub(crate) fn body(
             cancel = true;
         }
     });
+
+    // Milestone 4: One-Click Print Failover Modal
+    failover_modal_window(ui.ctx(), d);
+
     (go, cancel)
+}
+
+fn preset_and_diagnostics_row(ui: &mut egui::Ui, d: &mut PrintDraft) {
+    ui.horizontal(|ui| {
+        let active_name = d.preset_store.active_preset().map_or("Custom Setup", |p| &p.name);
+        let mut chosen_preset = None;
+        craft_ui::ComboBox::from_id_salt("job-preset-picker")
+            .selected_text(active_name)
+            .width(175.0)
+            .show_ui(ui, |ui| {
+                for preset in d.preset_store.list_presets() {
+                    if ui
+                        .selectable_label(d.preset_store.active_preset_id.as_deref() == Some(&preset.id), &preset.name)
+                        .clicked()
+                    {
+                        chosen_preset = Some(preset.clone());
+                    }
+                }
+            });
+        if let Some(p) = chosen_preset {
+            d.preset_store.active_preset_id = Some(p.id.clone());
+            d.apply_preset(&p);
+        }
+
+        if ui
+            .small_button(tl!("+ Save"))
+            .on_hover_text(tl!("Save current print settings as a reusable preset"))
+            .clicked()
+        {
+            d.new_preset_name = match d.new_preset_name {
+                Some(_) => None,
+                None => Some(String::new()),
+            };
+        }
+
+        if ui
+            .small_button(tl!("📋 Copy Diagnostics"))
+            .on_hover_text(tl!("Copy full GFM Markdown diagnostic report to clipboard"))
+            .clicked()
+        {
+            let report = collect_ui_diagnostic_report(d);
+            ui.ctx().copy_text(report.to_markdown_table());
+        }
+
+        if ui
+            .small_button(tl!("💾 Export JSON"))
+            .on_hover_text(tl!("Export diagnostic report as JSON to file (and copy to clipboard)"))
+            .clicked()
+        {
+            export_diagnostics_json(ui.ctx(), d);
+        }
+    });
+}
+
+fn export_diagnostics_json(ctx: &egui::Context, d: &PrintDraft) {
+    let report = collect_ui_diagnostic_report(d);
+    if let Ok(json) = report.to_json_pretty() {
+        ctx.copy_text(json.clone());
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::thread::spawn(move || {
+                let file = pollster::block_on(
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Export Diagnostic Report")
+                        .set_file_name("pdfcraft-diagnostics.json")
+                        .add_filter("JSON", &["json"])
+                        .save_file(),
+                );
+                if let Some(file) = file {
+                    let _ = std::fs::write(file.path(), json);
+                }
+            });
+        }
+    }
+}
+
+fn save_preset_inline_row(ui: &mut egui::Ui, d: &mut PrintDraft) {
+    let Some(mut name_buf) = d.new_preset_name.clone() else { return };
+    let mut save = false;
+    let mut cancel = false;
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(&mut name_buf).hint_text(tl!("Preset name")).desired_width(180.0));
+        save = ui.add_enabled(!name_buf.trim().is_empty(), egui::Button::new(tl!("Save Preset"))).clicked();
+        cancel = ui.button(tl!("Cancel")).clicked();
+    });
+    if save {
+        let clean = name_buf.trim().to_string();
+        let id = format!("user-preset-{}", d.preset_store.presets.len() + 1);
+        let preset = d.snapshot_as_preset(id.clone(), clean);
+        d.preset_store.upsert_preset(preset);
+        d.preset_store.set_active_preset(Some(id));
+        d.new_preset_name = None;
+    } else if cancel {
+        d.new_preset_name = None;
+    } else {
+        d.new_preset_name = Some(name_buf);
+    }
+}
+
+fn cluster_mode_header_row(ui: &mut egui::Ui, d: &mut PrintDraft) {
+    let was_multi = d.multi_printer_mode;
+    ui.horizontal(|ui| {
+        ui.add(widgets::checkbox(&mut d.multi_printer_mode, tl!("Multi-Printer Cluster Dispatch")));
+        if d.multi_printer_mode && !was_multi {
+            if d.selected_printers.is_empty()
+                && let Some(ref primary) = d.printer
+                && primary != crate::web_print::BROWSER_PRINTER
+            {
+                d.selected_printers.insert(primary.clone());
+            }
+            if d.active_preview_printer.is_none() {
+                d.active_preview_printer = d.selected_printers.iter().next().cloned().or_else(|| d.printer.clone());
+            }
+            if let Some(ref preview) = d.active_preview_printer {
+                d.read_caps_for = Some(preview.clone());
+            }
+        }
+        if d.multi_printer_mode {
+            if !d.preset_store.groups.is_empty() {
+                let active_group = d.preset_store.active_group().map_or("Select Group", |g| &g.name);
+                let mut chosen_group = None;
+                craft_ui::ComboBox::from_id_salt("printer-group-picker")
+                    .selected_text(active_group)
+                    .width(135.0)
+                    .show_ui(ui, |ui| {
+                        for group in d.preset_store.list_groups() {
+                            if ui
+                                .selectable_label(d.preset_store.active_group_id.as_deref() == Some(&group.id), &group.name)
+                                .clicked()
+                            {
+                                chosen_group = Some(group.id.clone());
+                            }
+                        }
+                    });
+                if let Some(gid) = chosen_group {
+                    d.select_printer_group(&gid);
+                    if let Some(ref preview) = d.active_preview_printer {
+                        d.read_caps_for = Some(preview.clone());
+                    }
+                }
+            }
+            if ui
+                .small_button(tl!("+ Save Group"))
+                .on_hover_text(tl!("Save selected printers as a reusable printer group"))
+                .clicked()
+            {
+                d.new_group_name = match d.new_group_name {
+                    Some(_) => None,
+                    None => Some(String::new()),
+                };
+            }
+        }
+    });
+}
+
+fn save_group_inline_row(ui: &mut egui::Ui, d: &mut PrintDraft) {
+    let Some(mut name_buf) = d.new_group_name.clone() else { return };
+    let mut save = false;
+    let mut cancel = false;
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(&mut name_buf).hint_text(tl!("Printer group name")).desired_width(180.0));
+        let can_save = !name_buf.trim().is_empty() && !d.selected_printers.is_empty();
+        save = ui.add_enabled(can_save, egui::Button::new(tl!("Save Group"))).clicked();
+        cancel = ui.button(tl!("Cancel")).clicked();
+    });
+    if save {
+        let clean = name_buf.trim().to_string();
+        let id = format!("group-{}", d.preset_store.groups.len() + 1);
+        let group = crate::workflows::print_presets::PrinterGroup::with_printers(
+            id.clone(),
+            clean,
+            d.selected_printers.iter().cloned(),
+            false,
+        );
+        d.preset_store.upsert_group(group);
+        d.preset_store.set_active_group(Some(id));
+        d.new_group_name = None;
+    } else if cancel {
+        d.new_group_name = None;
+    } else {
+        d.new_group_name = Some(name_buf);
+    }
+}
+
+fn cluster_printers_panel(ui: &mut egui::Ui, d: &mut PrintDraft, t: &Tokens) {
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            if ui.small_button(tl!("Select All")).clicked() {
+                for p in &d.printers {
+                    if p.name != crate::web_print::BROWSER_PRINTER {
+                        d.selected_printers.insert(p.name.clone());
+                    }
+                }
+                if d.active_preview_printer.is_none() {
+                    d.active_preview_printer = d.selected_printers.iter().next().cloned();
+                    d.read_caps_for = d.active_preview_printer.clone();
+                }
+            }
+            if ui.small_button(tl!("Clear")).clicked() {
+                d.selected_printers.clear();
+            }
+            ui.label(
+                egui::RichText::new(format!("({} selected)", d.selected_printers.len()))
+                    .small()
+                    .color(t.text_muted),
+            );
+        });
+        egui::ScrollArea::vertical().id_salt("printer-cluster-grid").max_height(105.0).show(ui, |ui| {
+            let printer_list = d.printers.clone();
+            for p in &printer_list {
+                ui.horizontal(|ui| {
+                    let mut is_selected = d.selected_printers.contains(&p.name);
+                    if ui.add(widgets::checkbox(&mut is_selected, p.name.as_str())).changed() {
+                        if is_selected {
+                            d.selected_printers.insert(p.name.clone());
+                            d.read_caps_for = Some(p.name.clone());
+                        } else {
+                            d.selected_printers.remove(&p.name);
+                        }
+                    }
+                    if p.default {
+                        ui.label(egui::RichText::new("(default)").small().color(t.text_muted));
+                    }
+                    let is_preview = d.active_preview_printer.as_deref() == Some(&p.name);
+                    if ui.selectable_label(is_preview, "👁 Preview").clicked() {
+                        d.active_preview_printer = Some(p.name.clone());
+                        if let Some(caps) = d.cached_capabilities.get(&p.name).cloned() {
+                            d.apply_capabilities_telemetry(p.name.clone(), caps);
+                        } else {
+                            d.read_caps_for = Some(p.name.clone());
+                        }
+                    }
+                });
+            }
+        });
+        if d.selected_printers.is_empty() {
+            ui.label(
+                egui::RichText::new(tl!("Select at least one target printer to dispatch the batch."))
+                    .small()
+                    .color(Color32::from_rgb(220, 80, 35)),
+            );
+        } else if matches!(d.duplex, Some(spool::Duplex::LongEdge | spool::Duplex::ShortEdge)) {
+            let simplex_only: Vec<&str> = d
+                .selected_printers
+                .iter()
+                .filter(|name| d.printer_two_sided_for(name) == Some(false))
+                .map(String::as_str)
+                .collect();
+            if !simplex_only.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "⚠️ Simplex hardware detected ({}) — two-sided printers will print duplex while simplex devices fall back safely.",
+                        simplex_only.join(", ")
+                    ))
+                    .small()
+                    .color(Color32::from_rgb(205, 130, 20)),
+                );
+            }
+        }
+    });
+}
+
+pub(crate) fn failover_modal_window(ctx: &egui::Context, d: &mut PrintDraft) {
+    let copy_diag_clicked = std::cell::Cell::new(false);
+    if let Some(modal) = &mut d.failover_modal {
+        let mut modal_open = true;
+        let mut close_modal = false;
+        egui::Window::new(tl!("One-Click Print Failover"))
+            .open(&mut modal_open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_width(390.0);
+                ui.heading("⚠️ Printer Hardware / Spooler Fault");
+                ui.add_space(4.0);
+                ui.label(format!("Faulted Printer: {}", modal.from_printer));
+                ui.label(format!("Failure Cause: {}", modal.error_message));
+                ui.label(format!("Faulted Sheet Index: #{}", modal.failed_sheet + 1));
+                ui.label(format!(
+                    "Committed: {} sheets | Pending: {} sheets",
+                    modal.committed_sheets, modal.pending_sheets
+                ));
+                ui.separator();
+                ui.label(tl!("Select Failover Target Printer:"));
+                craft_ui::ComboBox::from_id_salt("failover-target-printer")
+                    .selected_text(if modal.to_printer.is_empty() {
+                        "Pick Target Printer"
+                    } else {
+                        &modal.to_printer
+                    })
+                    .width(260.0)
+                    .show_ui(ui, |ui| {
+                        for p in &d.printers {
+                            if p.name != modal.from_printer {
+                                ui.selectable_value(&mut modal.to_printer, p.name.clone(), &p.name);
+                            }
+                        }
+                    });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let can_reroute = !modal.to_printer.is_empty() && modal.to_printer != modal.from_printer;
+                    if ui
+                        .add_enabled(can_reroute, egui::Button::new(tl!("Reroute Remaining Sheets (Zero Duplicates)")))
+                        .clicked()
+                    {
+                        d.pending_failover = Some((modal.from_printer.clone(), modal.to_printer.clone()));
+                        close_modal = true;
+                    }
+                    if ui.button(tl!("📋 Copy Diagnostics")).clicked() {
+                        copy_diag_clicked.set(true);
+                    }
+                    if ui.button(tl!("Cancel")).clicked() {
+                        close_modal = true;
+                    }
+                });
+            });
+        if !modal_open || close_modal {
+            d.failover_modal = None;
+        }
+    }
+    if copy_diag_clicked.get() {
+        let report = collect_ui_diagnostic_report(d);
+        ctx.copy_text(report.to_markdown_table());
+    }
 }
 
 /// The row that adds a custom paper: name, width and height in the preferences' unit.
@@ -736,6 +1156,262 @@ fn custom_paper_row(ui: &mut egui::Ui, d: &mut PrintDraft, t: &Tokens) {
     } else if cancel {
         d.custom_new = None;
     }
+}
+
+fn build_printer_telemetry(
+    d: &PrintDraft,
+    p: &spool::Printer,
+) -> pdfcraft_platform::diagnostics::PrinterCapabilitiesTelemetry {
+    use pdfcraft_platform::diagnostics::{
+        DriverGenerationKind, DuplexBindingKind, MarginsPt, PrinterCapabilitiesTelemetry, ResolutionDpi, SizePt,
+    };
+
+    if let Some(mut cached) = d.cached_capabilities.get(&p.name).cloned() {
+        cached.is_default = p.default;
+        cached.supported_paper_count = d.papers.len();
+        return cached;
+    }
+
+    let preview_target = if d.multi_printer_mode {
+        d.active_preview_printer.as_deref().or(d.printer.as_deref())
+    } else {
+        d.printer.as_deref()
+    };
+    let is_active = preview_target == Some(p.name.as_str());
+    let margins = if is_active {
+        d.preview_hardware_margins.unwrap_or([0.0, 0.0, 0.0, 0.0])
+    } else {
+        [0.0, 0.0, 0.0, 0.0]
+    };
+    let printable = if is_active {
+        d.preview_printable_area.unwrap_or((612.0, 792.0))
+    } else {
+        (612.0, 792.0)
+    };
+    let is_duplex = d.printer_two_sided_for(&p.name).unwrap_or(false);
+    let generation = if cfg!(windows) {
+        if spool::xps_driver(&p.name) == Some(true) {
+            DriverGenerationKind::Win32V4PrintTicket
+        } else {
+            DriverGenerationKind::Win32V3DevMode
+        }
+    } else {
+        DriverGenerationKind::CupsIpp
+    };
+    PrinterCapabilitiesTelemetry {
+        printer_name: p.name.clone(),
+        driver_name: p.name.clone(),
+        driver_version: "System Queue".to_string(),
+        driver_generation: generation,
+        port_name: "SystemPort".to_string(),
+        is_default: p.default,
+        is_color_supported: true,
+        is_duplex_supported: is_duplex,
+        supported_duplex_modes: if is_duplex {
+            vec![
+                DuplexBindingKind::Simplex,
+                DuplexBindingKind::FlipLongEdge,
+                DuplexBindingKind::FlipShortEdge,
+            ]
+        } else {
+            vec![DuplexBindingKind::Simplex]
+        },
+        max_copies: 999,
+        hardware_margins_pt: MarginsPt {
+            left: margins[0],
+            top: margins[1],
+            right: margins[2],
+            bottom: margins[3],
+        },
+        printable_area_pt: SizePt {
+            width: printable.0,
+            height: printable.1,
+        },
+        physical_sheet_pt: SizePt {
+            width: printable.0 + margins[0] + margins[2],
+            height: printable.1 + margins[1] + margins[3],
+        },
+        resolution_dpi: ResolutionDpi { dpi_x: 600, dpi_y: 600 },
+        supported_paper_count: d.papers.len(),
+    }
+}
+
+fn build_applied_ticket(
+    d: &PrintDraft,
+    printer_name: &str,
+) -> pdfcraft_platform::diagnostics::AppliedTicketTelemetry {
+    use pdfcraft_platform::diagnostics::{
+        AppliedColorMode, AppliedOrientation, AppliedTicketTelemetry, DriverGenerationKind, DuplexBindingKind,
+        TicketDetails,
+    };
+
+    let job = d.job_for_printer(Some(printer_name), "diagnostic-preview.pdf");
+    let color_mode = if d.grayscale {
+        AppliedColorMode::MonochromeKOnly
+    } else {
+        AppliedColorMode::Color
+    };
+    let duplex_mode = match job.duplex {
+        Some(spool::Duplex::LongEdge) => DuplexBindingKind::FlipLongEdge,
+        Some(spool::Duplex::ShortEdge) => DuplexBindingKind::FlipShortEdge,
+        _ => DuplexBindingKind::Simplex,
+    };
+    let orientation = match d.orientation {
+        Orientation::Landscape => AppliedOrientation::Landscape,
+        _ => AppliedOrientation::Portrait,
+    };
+    let paper_name = d.paper_name().to_string();
+    let generation = d
+        .cached_capabilities
+        .get(printer_name)
+        .map(|c| c.driver_generation)
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                if spool::xps_driver(printer_name) == Some(true) {
+                    DriverGenerationKind::Win32V4PrintTicket
+                } else {
+                    DriverGenerationKind::Win32V3DevMode
+                }
+            } else {
+                DriverGenerationKind::CupsIpp
+            }
+        });
+
+    let details = match generation {
+        DriverGenerationKind::Win32V4PrintTicket => TicketDetails::PrintTicketV4 {
+            feature_color: if d.grayscale {
+                "psk:Grayscale (+ K-Only Filter)".to_string()
+            } else {
+                "psk:Color".to_string()
+            },
+            feature_duplex: match duplex_mode {
+                DuplexBindingKind::Simplex => "psk:OneSided".to_string(),
+                DuplexBindingKind::FlipLongEdge => "psk:TwoSidedLongEdge".to_string(),
+                DuplexBindingKind::FlipShortEdge => "psk:TwoSidedShortEdge".to_string(),
+            },
+            feature_orientation: format!("{orientation:?}"),
+            feature_media_size: paper_name.clone(),
+            raw_xml_snippet: None,
+        },
+        DriverGenerationKind::CupsIpp => TicketDetails::CupsIpp {
+            print_color_mode: if d.grayscale {
+                "monochrome".to_string()
+            } else {
+                "color".to_string()
+            },
+            sides: match duplex_mode {
+                DuplexBindingKind::Simplex => "one-sided".to_string(),
+                DuplexBindingKind::FlipLongEdge => "two-sided-long-edge".to_string(),
+                DuplexBindingKind::FlipShortEdge => "two-sided-short-edge".to_string(),
+            },
+            media: paper_name.clone(),
+            copies: job.copies,
+            raw_options: job.options,
+        },
+        _ => TicketDetails::DevModeV3 {
+            dm_fields_bitmask: 0x0001 | 0x0002 | 0x0004 | 0x0800 | 0x1000,
+            dm_size: 220,
+            dm_driver_extra_bytes: 1024,
+            dm_color: if d.grayscale { 1 } else { 2 },
+            dm_duplex: match duplex_mode {
+                DuplexBindingKind::Simplex => 1,
+                DuplexBindingKind::FlipLongEdge => 2,
+                DuplexBindingKind::FlipShortEdge => 3,
+            },
+            dm_orientation: match orientation {
+                AppliedOrientation::Landscape => 2,
+                AppliedOrientation::Portrait => 1,
+            },
+            dm_copies: job.copies as i16,
+            dm_papersize: 1,
+            dm_collate: if job.collate { 1 } else { 0 },
+        },
+    };
+
+    AppliedTicketTelemetry {
+        printer_name: printer_name.to_string(),
+        generation,
+        color_mode,
+        duplex_mode,
+        orientation,
+        paper_size_name: paper_name,
+        copies: job.copies,
+        details,
+    }
+}
+
+/// Harvests active print studio state into a complete platform DiagnosticReport.
+pub(crate) fn collect_ui_diagnostic_report(d: &PrintDraft) -> pdfcraft_platform::diagnostics::DiagnosticReport {
+    use pdfcraft_platform::diagnostics::{
+        DiagnosticReport, TraceCategory, TraceLevel, TraceRecord, collect_diagnostic_report,
+    };
+
+    let now_ts = DiagnosticReport::harvest_system().generated_at;
+    let printers = d.printers.iter().map(|p| build_printer_telemetry(d, p)).collect();
+    let applied_tickets = d
+        .target_printers()
+        .iter()
+        .map(|name| build_applied_ticket(d, name))
+        .collect();
+
+    let mut traces = d.diagnostic_traces.clone();
+    let mut ctx = std::collections::BTreeMap::new();
+    ctx.insert("copies".to_string(), d.copies.to_string());
+    ctx.insert("grayscale".to_string(), d.grayscale.to_string());
+    ctx.insert("multi_printer_mode".to_string(), d.multi_printer_mode.to_string());
+    ctx.insert("selected_printers".to_string(), d.selected_printers.len().to_string());
+    if let Some(preset) = d.preset_store.active_preset() {
+        ctx.insert("active_preset".to_string(), preset.name.clone());
+    }
+    traces.push(TraceRecord {
+        timestamp: now_ts,
+        level: TraceLevel::Info,
+        category: TraceCategory::DriverNegotiation,
+        printer_name: d.printer.clone(),
+        error_code: None,
+        message: format!("Print studio pre-flight snapshot (targets: {:?})", d.target_printers()),
+        context: ctx,
+    });
+    if let Some(hazard) = d.clipping_hazard {
+        let mut h_ctx = std::collections::BTreeMap::new();
+        h_ctx.insert("left_pt".to_string(), format!("{:.2}", hazard[0]));
+        h_ctx.insert("top_pt".to_string(), format!("{:.2}", hazard[1]));
+        h_ctx.insert("right_pt".to_string(), format!("{:.2}", hazard[2]));
+        h_ctx.insert("bottom_pt".to_string(), format!("{:.2}", hazard[3]));
+        traces.push(TraceRecord {
+            timestamp: now_ts,
+            level: TraceLevel::Warning,
+            category: TraceCategory::MarginAdaptation,
+            printer_name: d.active_preview_printer.clone().or_else(|| d.printer.clone()),
+            error_code: Some("CLIPPING_HAZARD".to_string()),
+            message: format!(
+                "Clipping hazard detected: overflow [L:{:.1}, T:{:.1}, R:{:.1}, B:{:.1}] pt",
+                hazard[0], hazard[1], hazard[2], hazard[3]
+            ),
+            context: h_ctx,
+        });
+    }
+    if let Some(modal) = &d.failover_modal {
+        let mut f_ctx = std::collections::BTreeMap::new();
+        f_ctx.insert("from_printer".to_string(), modal.from_printer.clone());
+        f_ctx.insert("to_printer".to_string(), modal.to_printer.clone());
+        f_ctx.insert("failed_sheet".to_string(), modal.failed_sheet.to_string());
+        traces.push(TraceRecord {
+            timestamp: now_ts,
+            level: TraceLevel::Error,
+            category: TraceCategory::Failover,
+            printer_name: Some(modal.from_printer.clone()),
+            error_code: Some("HARDWARE_FAILURE".to_string()),
+            message: format!(
+                "Printer failure: {} at sheet #{}",
+                modal.error_message,
+                modal.failed_sheet + 1
+            ),
+            context: f_ctx,
+        });
+    }
+
+    collect_diagnostic_report(printers, applied_tickets, traces)
 }
 
 #[cfg(test)]

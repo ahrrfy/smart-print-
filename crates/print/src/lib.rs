@@ -16,15 +16,40 @@
 //! the system's print spooler (CUPS on macOS and Linux).
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+#![allow(clippy::collapsible_if)]
 
 use pdfcraft_content::Matrix;
 use pdfcraft_cos::{DecodeBudget, Dict, Document, ObjRef, Object, SaveOptions, Stream, write_full};
 
 mod font_names;
+pub mod driver;
+pub mod duplex;
+pub mod governor;
+pub mod margins;
+pub mod monochrome;
 pub mod range;
 pub mod spool;
+pub mod stream;
 #[cfg(test)]
 mod tests;
+
+pub use duplex::{
+    align_sheet_pair_orientation, plan_duplex_sheets, DuplexBinding, DuplexSheetPair,
+};
+pub use governor::{
+    calculate_required_spool_bytes, evaluate_disk_verdict, ConcurrencyGovernor, CountingSemaphore,
+    CpuPermitGuard, DiskVerdict, GovernorError, PrinterJobEstimate, SheetRasterMode,
+    SpoolDiskStatus, SpoolPermitGuard,
+};
+pub use stream::{
+    bounded_stream_channel, CancellationToken, PageStreamProducer, SheetBuffer, SheetData,
+    SheetReceiver, SheetSender,
+};
+pub use margins::{
+    calculate_page_transform, ClippingExtent, HardwareMargins, PageFitMode, PageTransform,
+    PrintableBounds,
+};
+pub use monochrome::MonochromeVectorFilter;
 
 pub use range::{Subset, position, select_listed, select_pages};
 
@@ -36,7 +61,7 @@ mod sheets;
 pub use error::{PrintError, WORDINGS, Words, in_english};
 #[cfg(test)]
 use imposition::{PAGES_LISTED, appearance, appearance_matrix, decoded_contents, page_form, prints};
-pub use imposition::{impose, keep_printed, sheet_pages};
+pub use imposition::{impose, impose_single_sheet, keep_printed, sheet_pages};
 pub use settings::{
     Binding, BookletSubset, Content, Crop, LABEL_PAPER, Layout, MAX_GRID, Orientation, PAPERS, PageOrder, Raster, Settings, SizeMode, booklet_duplex,
     booklet_job_duplex, cups_media, custom_media, driver_needs_grayscale, media_option, paper_media, paper_media_option,

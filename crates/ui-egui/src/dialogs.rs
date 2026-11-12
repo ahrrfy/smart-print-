@@ -99,6 +99,9 @@ pub fn show(app: &mut PdfCraftApp, ctx: &egui::Context) {
         ctx.set_cursor_icon(egui::CursorIcon::Default);
     }
     dialogs(app, ctx);
+    if app.dialog != Some(Dialog::Print) && app.print_draft.failover_modal.is_some() {
+        crate::print_ui::failover_modal_window(ctx, &mut app.print_draft);
+    }
     // Above Document Properties when Security's Unlock… asked for it; script prompts stay on top.
     unlock(app, ctx);
     #[cfg(not(target_arch = "wasm32"))]

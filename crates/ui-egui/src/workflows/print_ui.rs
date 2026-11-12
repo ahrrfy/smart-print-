@@ -15,7 +15,7 @@ mod body;
 mod draft;
 mod setups;
 
-pub(crate) use body::body;
+pub(crate) use body::{body, failover_modal_window};
 pub use draft::{CUSTOM_SCALE, Handling, IMAGE_DPI, PrintDraft, Which};
 pub use setups::PrinterSetup;
 pub(crate) use setups::{from_json as setups_from_json, to_json as setups_to_json};
@@ -100,6 +100,18 @@ pub(crate) struct PrintTasks {
     /// Cached papers and default paper per printer so switching printers avoids re-querying.
     #[cfg(not(target_arch = "wasm32"))]
     papers_cache: std::collections::HashMap<String, PaperInfo>,
+    /// Milestone 4: active multi-printer coordinator handles.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) coordinator_handles: Vec<pdfcraft_engine::print_coordinator::MultiJobHandle>,
+    /// Milestone 4: live stream health telemetry per printer for status badge rendering.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) stream_telemetry: std::collections::BTreeMap<String, pdfcraft_engine::print_coordinator::PrinterStreamTelemetry>,
+    /// Hardware capabilities (margins, printable area, DPI, duplex, color) read in background per printer.
+    #[cfg(not(target_arch = "wasm32"))]
+    caps: Vec<(
+        String,
+        std::sync::mpsc::Receiver<Option<pdfcraft_platform::diagnostics::PrinterCapabilitiesTelemetry>>,
+    )>,
     /// The browser print being drawn, a sheet a frame (`web_print`).
     #[cfg(target_arch = "wasm32")]
     web_job: Option<crate::web_print::WebPrintJob>,
@@ -180,6 +192,56 @@ impl Drop for WakeOnExit {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn make_trace(
+    level: pdfcraft_platform::diagnostics::TraceLevel,
+    category: pdfcraft_platform::diagnostics::TraceCategory,
+    printer_name: Option<String>,
+    message: String,
+    error_code: Option<String>,
+) -> pdfcraft_platform::diagnostics::TraceRecord {
+    let duration = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .unwrap_or(std::time::Duration::ZERO);
+    let timestamp = chrono::DateTime::from_timestamp(duration.as_secs() as i64, duration.subsec_nanos())
+        .unwrap_or_default();
+    pdfcraft_platform::diagnostics::TraceRecord {
+        timestamp,
+        level,
+        category,
+        printer_name,
+        message,
+        error_code,
+        context: std::collections::BTreeMap::new(),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn coordinator_progress_summary(
+    handle: &pdfcraft_engine::print_coordinator::MultiJobHandle,
+) -> Option<(String, f32)> {
+    let tel_map = handle.all_telemetry();
+    if tel_map.is_empty() {
+        return None;
+    }
+    let printer_count = tel_map.len();
+    let mut done_sheets = 0usize;
+    let mut total_sheets = 0usize;
+    for tel in tel_map.values() {
+        done_sheets = done_sheets.saturating_add(tel.ledger.committed_count());
+        total_sheets = total_sheets.saturating_add(tel.total_sheets);
+    }
+    let fraction = if total_sheets > 0 {
+        (done_sheets as f32 / total_sheets as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let label = format!(
+        "Cluster printing: {done_sheets}/{total_sheets} sheets across {printer_count} printers…"
+    );
+    Some((label, fraction))
+}
+
 impl PdfCraftApp {
     /// Open the Print dialog, preselecting the default printer and reading papers in the background.
     pub fn open_print(&mut self) {
@@ -256,7 +318,14 @@ impl PdfCraftApp {
         }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(p) = printer {
-            self.read_papers_in_background(p);
+            self.read_papers_in_background(p.clone());
+            self.read_caps_in_background(p);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.print_draft.multi_printer_mode
+            && let Some(preview) = self.print_draft.active_preview_printer.clone()
+        {
+            self.read_caps_in_background(preview);
         }
         self.dialog = Some(crate::Dialog::Print);
     }
@@ -434,6 +503,171 @@ impl PdfCraftApp {
         }
     }
 
+    /// Read `printer`'s hardware capabilities (physical margins, printable area, DPI, duplex, color)
+    /// off the GUI thread so live clipping-hazard preview and pre-flight telemetry stay responsive.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_caps_in_background(&mut self, printer: String) {
+        if printer == crate::web_print::BROWSER_PRINTER {
+            return;
+        }
+        if let Some(cached) = self.print_draft.cached_capabilities.get(&printer).cloned() {
+            self.print_draft.apply_capabilities_telemetry(printer, cached);
+            return;
+        }
+        // Skip OS GDI DC queries when running with an injected test spooler stand-in.
+        if self.spooler.is_some()
+            || self.print_tasks.caps.iter().any(|(p, _)| *p == printer)
+            || self.print_tasks.caps.len() >= TWO_SIDED_READS
+        {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = WakeOnExit(self.ctx.clone());
+        let name = printer.clone();
+        let spawned = std::thread::Builder::new().name("printer caps".into()).spawn(move || {
+            let _wake = wake;
+            let tel = pdfcraft_platform::caps::query_gdi_capabilities(&name)
+                .ok()
+                .map(|c| pdfcraft_platform::diagnostics::PrinterCapabilitiesTelemetry::from_capabilities(&c));
+            let _ = tx.send(tel);
+        });
+        if spawned.is_ok() {
+            self.print_tasks.caps.push((printer, rx));
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_caps(&mut self) {
+        if let Some(printer) = self.print_draft.read_caps_for.take() {
+            self.read_caps_in_background(printer);
+        }
+        let mut arrived = Vec::new();
+        self.print_tasks.caps.retain(|(printer, rx)| match rx.try_recv() {
+            Ok(Some(caps)) => {
+                arrived.push((printer.clone(), caps));
+                false
+            }
+            Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+        });
+        for (printer, caps) in arrived {
+            self.print_draft.apply_capabilities_telemetry(printer, caps);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_coordinator(&mut self) {
+        use pdfcraft_engine::print_coordinator::CoordinatorEvent;
+        use pdfcraft_platform::diagnostics::{TraceCategory, TraceLevel};
+
+        let mut completed_notices: Vec<(String, usize)> = Vec::new();
+        let mut traces = Vec::new();
+
+        self.print_tasks.coordinator_handles.retain_mut(|handle| {
+            let events = handle.poll_events();
+            for event in events {
+                match event {
+                    CoordinatorEvent::ProgressUpdate(tel) => {
+                        self.print_tasks.stream_telemetry.insert(tel.printer_name.clone(), tel);
+                    }
+                    CoordinatorEvent::PrinterCompleted { printer_name, total_sheets, duration_secs } => {
+                        if let Some(t) = handle.get_telemetry(&printer_name) {
+                            self.print_tasks.stream_telemetry.insert(printer_name.clone(), t.clone());
+                        }
+                        traces.push(make_trace(
+                            TraceLevel::Info,
+                            TraceCategory::Spooler,
+                            Some(printer_name.clone()),
+                            format!("Completed {total_sheets} sheets in {duration_secs:.2}s"),
+                            None,
+                        ));
+                        completed_notices.push((printer_name, total_sheets));
+                    }
+                    CoordinatorEvent::PrinterFailed {
+                        printer_name,
+                        error,
+                        committed_sheets,
+                        pending_sheets,
+                        suggested_failover,
+                    } => {
+                        if let Some(t) = handle.get_telemetry(&printer_name) {
+                            self.print_tasks.stream_telemetry.insert(printer_name.clone(), t.clone());
+                        }
+                        let committed = committed_sheets.len();
+                        let total = committed_sheets.len() + pending_sheets.len();
+                        let pending = pending_sheets.len();
+                        let failed_sheet = committed;
+                        let fallback = suggested_failover.unwrap_or_else(|| {
+                            self.print_draft
+                                .printers
+                                .iter()
+                                .find(|p| p.name != printer_name)
+                                .map(|p| p.name.clone())
+                                .unwrap_or_default()
+                        });
+                        traces.push(make_trace(
+                            TraceLevel::Error,
+                            TraceCategory::Failover,
+                            Some(printer_name.clone()),
+                            format!(
+                                "Stream fault at sheet #{}: {error} (committed={committed}, pending={pending})",
+                                failed_sheet + 1
+                            ),
+                            Some("PRINTER_STREAM_FAULT".to_string()),
+                        ));
+                        self.print_draft.failover_modal = Some(draft::FailoverModalState {
+                            from_printer: printer_name,
+                            to_printer: fallback,
+                            failed_sheet,
+                            committed_sheets: committed,
+                            pending_sheets: pending,
+                            total_sheets: total,
+                            error_message: error,
+                        });
+                    }
+                    CoordinatorEvent::StreamStalled { printer_name, stalled_duration_secs } => {
+                        if let Some(t) = handle.get_telemetry(&printer_name) {
+                            self.print_tasks.stream_telemetry.insert(printer_name.clone(), t.clone());
+                        }
+                        traces.push(make_trace(
+                            TraceLevel::Warning,
+                            TraceCategory::Spooler,
+                            Some(printer_name),
+                            format!("Spool stream stalled for {stalled_duration_secs}s"),
+                            Some("STREAM_STALLED".to_string()),
+                        ));
+                    }
+                    CoordinatorEvent::FailoverDispatched { from_printer, to_printer, rerouted_sheets } => {
+                        if let Some(t) = handle.get_telemetry(&to_printer) {
+                            self.print_tasks.stream_telemetry.insert(to_printer.clone(), t.clone());
+                        }
+                        traces.push(make_trace(
+                            TraceLevel::Info,
+                            TraceCategory::Failover,
+                            Some(to_printer.clone()),
+                            format!("Rerouted {rerouted_sheets} uncommitted sheets from '{from_printer}' to '{to_printer}'"),
+                            None,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            !handle.is_all_completed()
+        });
+
+        for trace in traces {
+            self.print_draft.push_trace(trace);
+        }
+        for (printer, sheets) in completed_notices {
+            self.notify(format!("Sent to {printer} ({sheets} sheets)"));
+        }
+
+        // Milestone 4: process pending failover rerouting request triggered from modal
+        if let Some((from_printer, to_printer)) = self.print_draft.pending_failover.take() {
+            self.execute_failover_reroute(&from_printer, &to_printer);
+        }
+    }
+
     /// Pick up a printer list, driver options or a spooled job that finished (each frame).
     pub(crate) fn poll_print(&mut self) {
         #[cfg(target_arch = "wasm32")]
@@ -506,11 +740,13 @@ impl PdfCraftApp {
                         d.reset_unoverridden_custom_paper();
                         d.apply_printer_papers(Vec::new());
                         if let Some(p) = d.printer.clone() {
-                            self.read_papers_in_background(p);
+                            self.read_papers_in_background(p.clone());
+                            self.read_caps_in_background(p);
                         }
                     }
                 }
             }
+            self.poll_caps();
             self.poll_two_sided();
             let mut finished = Vec::new();
             self.print_tasks.jobs.retain_mut(|job| {
@@ -529,10 +765,11 @@ impl PdfCraftApp {
                     }
                 }
             });
-            self.show_print_progress();
             for (printer, result) in finished {
                 self.report_print_job(&printer, result);
             }
+            self.poll_coordinator();
+            self.show_print_progress();
         }
     }
 
@@ -540,7 +777,29 @@ impl PdfCraftApp {
     /// spooler, while no other long job holds the card.
     #[cfg(not(target_arch = "wasm32"))]
     fn show_print_progress(&mut self) {
-        let Some(job) = self.print_tasks.jobs.first() else {
+        let progress_pair = if let Some(job) = self.print_tasks.jobs.first() {
+            let printer = job.printer.as_str();
+            let pair = match job.sheets {
+                Some((sent, sheets)) if sheets > 0 => {
+                    // The sheet on its way: one past those sent, until the last is.
+                    let sheet = sent.saturating_add(1).min(sheets).to_string();
+                    let label = crate::i18n::fmt(
+                        tl!("Sending sheet {s} of {n} to {printer}…"),
+                        &[("s", &sheet), ("n", &sheets.to_string()), ("printer", printer)],
+                    );
+                    (label, sent as f32 / sheets as f32)
+                }
+                _ => (crate::i18n::fmt(tl!("Sending to {printer}…"), &[("printer", printer)]), 0.0),
+            };
+            Some(pair)
+        } else {
+            self.print_tasks
+                .coordinator_handles
+                .first()
+                .and_then(coordinator_progress_summary)
+        };
+
+        let Some((label, fraction)) = progress_pair else {
             if std::mem::take(&mut self.print_tasks.showing_progress) {
                 self.progress_notice = None;
             }
@@ -549,19 +808,6 @@ impl PdfCraftApp {
         if self.progress_notice.is_some() && !self.print_tasks.showing_progress {
             return;
         }
-        let printer = job.printer.as_str();
-        let (label, fraction) = match job.sheets {
-            Some((sent, sheets)) if sheets > 0 => {
-                // The sheet on its way: one past those sent, until the last is.
-                let sheet = sent.saturating_add(1).min(sheets).to_string();
-                let label = crate::i18n::fmt(
-                    tl!("Sending sheet {s} of {n} to {printer}…"),
-                    &[("s", &sheet), ("n", &sheets.to_string()), ("printer", printer)],
-                );
-                (label, sent as f32 / sheets as f32)
-            }
-            _ => (crate::i18n::fmt(tl!("Sending to {printer}…"), &[("printer", printer)]), 0.0),
-        };
         self.progress_notice = Some(crate::widgets::ProgressNotice { label, fraction, cancellable: false });
         self.print_tasks.showing_progress = true;
         // The bar's sweep keeps moving between sheets.
@@ -570,8 +816,44 @@ impl PdfCraftApp {
         }
     }
 
-    /// Pick up two-sided answers that arrived, and ask for the picked printer's when the list
-    /// doesn't say, nobody has asked yet and fewer than [`TWO_SIDED_READS`] reads are running.
+    /// Executes one-click failover: cancels the faulted worker on `from_printer` and reroutes
+    /// all remaining unprinted sheets to `to_printer` with zero duplicate pages.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn execute_failover_reroute(&mut self, from_printer: &str, to_printer: &str) -> bool {
+        let mut rerouted = false;
+        for handle in &mut self.print_tasks.coordinator_handles {
+            if handle.all_telemetry().contains_key(from_printer) {
+                // Halt the faulted/stalled worker thread to guarantee zero duplicate sheets
+                handle.cancel_printer(from_printer);
+                match handle.failover_reroute(from_printer, to_printer) {
+                    Ok(()) => {
+                        if let Some(tel) = handle.get_telemetry(to_printer) {
+                            self.print_tasks.stream_telemetry.insert(to_printer.to_string(), tel.clone());
+                        }
+                        self.notify(format!("Rerouted remaining sheets to {to_printer}"));
+                        rerouted = true;
+                        break;
+                    }
+                    Err(err) => {
+                        self.print_draft.push_trace(make_trace(
+                            pdfcraft_platform::diagnostics::TraceLevel::Error,
+                            pdfcraft_platform::diagnostics::TraceCategory::Failover,
+                            Some(to_printer.to_string()),
+                            format!("Failover rerouting from '{from_printer}' failed: {err}"),
+                            Some("FAILOVER_FAILED".to_string()),
+                        ));
+                        self.notify_error(format!("Failover rerouting failed: {err}"));
+                        return false;
+                    }
+                }
+            }
+        }
+        rerouted
+    }
+
+    /// Pick up two-sided answers that arrived, and ask for the picked printer's (and selected
+    /// cluster printers') when the list doesn't say, nobody has asked yet and fewer than
+    /// [`TWO_SIDED_READS`] reads are running.
     #[cfg(not(target_arch = "wasm32"))]
     fn poll_two_sided(&mut self) {
         let d = &mut self.print_draft;
@@ -590,34 +872,234 @@ impl PdfCraftApp {
             return;
         }
         let Some(source) = self.two_sided_source.clone() else { return };
-        let Some(printer) = d.printers.iter().find(|p| d.printer.as_ref() == Some(&p.name)) else { return };
-        if printer.two_sided.is_some()
-            || d.two_sided.contains_key(&printer.name)
-            || self.print_tasks.two_sided.iter().any(|(n, _)| *n == printer.name)
-            || self.print_tasks.two_sided.len() >= TWO_SIDED_READS
-        {
-            return;
-        }
-        let name = printer.name.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let ctx = self.ctx.clone();
-        let asked = name.clone();
-        std::thread::spawn(move || {
-            // The receiver may be gone (the app quit): nothing to report to then.
-            let _ = tx.send(source(&asked));
-            if let Some(ctx) = ctx {
-                ctx.request_repaint();
+        let candidates: Vec<String> = d
+            .printer
+            .iter()
+            .chain(d.selected_printers.iter().filter(|_| d.multi_printer_mode))
+            .cloned()
+            .collect();
+        for candidate in candidates {
+            if self.print_tasks.two_sided.len() >= TWO_SIDED_READS {
+                break;
             }
-        });
-        self.print_tasks.two_sided.push((name, rx));
+            let Some(printer) = d.printers.iter().find(|p| p.name == candidate) else { continue };
+            if printer.two_sided.is_some()
+                || d.two_sided.contains_key(&printer.name)
+                || self.print_tasks.two_sided.iter().any(|(n, _)| *n == printer.name)
+            {
+                continue;
+            }
+            let name = printer.name.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = self.ctx.clone();
+            let asked = name.clone();
+            let src = source.clone();
+            std::thread::spawn(move || {
+                // The receiver may be gone (the app quit): nothing to report to then.
+                let _ = tx.send(src(&asked));
+                if let Some(ctx) = ctx {
+                    ctx.request_repaint();
+                }
+            });
+            self.print_tasks.two_sided.push((name, rx));
+        }
     }
 
     /// Report the outcome of a finished print job to the user.
     fn report_print_job(&mut self, printer: &str, result: Result<String, String>) {
         match result {
-            Ok(msg) if msg.is_empty() => self.notify(crate::i18n::fmt(tl!("Sent to {printer}"), &[("printer", printer)])),
-            Ok(msg) => self.notify(crate::i18n::fmt(tl!("Sent to {printer}: {msg}"), &[("printer", printer), ("msg", &msg)])),
-            Err(e) => self.notify_error(e),
+            Ok(msg) if msg.is_empty() => {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.print_draft.push_trace(make_trace(
+                    pdfcraft_platform::diagnostics::TraceLevel::Info,
+                    pdfcraft_platform::diagnostics::TraceCategory::Spooler,
+                    Some(printer.to_string()),
+                    "Spooler accepted print job".to_string(),
+                    None,
+                ));
+                self.notify(crate::i18n::fmt(tl!("Sent to {printer}"), &[("printer", printer)]));
+            }
+            Ok(msg) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.print_draft.push_trace(make_trace(
+                    pdfcraft_platform::diagnostics::TraceLevel::Info,
+                    pdfcraft_platform::diagnostics::TraceCategory::Spooler,
+                    Some(printer.to_string()),
+                    format!("Spooler accepted print job: {msg}"),
+                    None,
+                ));
+                self.notify(crate::i18n::fmt(tl!("Sent to {printer}: {msg}"), &[("printer", printer), ("msg", &msg)]));
+            }
+            Err(e) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.print_draft.push_trace(make_trace(
+                    pdfcraft_platform::diagnostics::TraceLevel::Error,
+                    pdfcraft_platform::diagnostics::TraceCategory::Spooler,
+                    Some(printer.to_string()),
+                    e.clone(),
+                    Some("SPOOL_SUBMIT_ERROR".to_string()),
+                ));
+                self.notify_error(e);
+            }
+        }
+    }
+
+    /// Pre-flight spooler disk headroom check before dispatching native print jobs.
+    /// Skipped when an injected test `spooler` stand-in is active.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn check_spooler_disk_headroom(&mut self) -> bool {
+        if self.spooler.is_some() {
+            return true;
+        }
+        let spool_tel = pdfcraft_platform::diagnostics::harvest_spooler_telemetry();
+        if spool_tel.total_bytes > 0
+            && spool_tel.disk_verdict == pdfcraft_platform::diagnostics::SpoolDiskVerdict::CriticalExhaustion
+        {
+            let free_mb = spool_tel.available_bytes / (1024 * 1024);
+            let msg = format!(
+                "Spooler disk space critically low ({free_mb} MB free in {}). Free disk space before printing.",
+                spool_tel.spool_directory
+            );
+            self.print_draft.push_trace(make_trace(
+                pdfcraft_platform::diagnostics::TraceLevel::Error,
+                pdfcraft_platform::diagnostics::TraceCategory::Spooler,
+                None,
+                msg.clone(),
+                Some("SPOOL_DISK_CRITICAL".to_string()),
+            ));
+            self.notify_error(msg);
+            return false;
+        }
+        true
+    }
+
+    /// Dispatches a unified print batch simultaneously across all selected cluster printers.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn dispatch_cluster_batch(
+        &mut self,
+        id: pdfcraft_engine::DocId,
+        name: String,
+        settings: print::Settings,
+        bytes: Vec<u8>,
+    ) -> bool {
+        use pdfcraft_engine::print_coordinator::{
+            BatchDispatchConfig, PrintOrchestrationCoordinator, SharedPdfSource, SpoolSubmitFn,
+        };
+        use pdfcraft_platform::diagnostics::{TraceCategory, TraceLevel};
+
+        let printers: Vec<String> = self.print_draft.selected_printers.iter().cloned().collect();
+        if printers.is_empty() {
+            self.notify_error("Select at least one target printer to dispatch the batch.");
+            return false;
+        }
+        if !self.check_spooler_disk_headroom() {
+            return false;
+        }
+        let Some(doc) = self.session.get(id) else { return false };
+        let sizes: Vec<(f64, f64)> = doc
+            .info
+            .pages
+            .iter()
+            .map(|p| (f64::from(p.width), f64::from(p.height)))
+            .collect();
+        let sheets = match print::layout(&sizes, &settings) {
+            Ok(s) => s,
+            Err(e) => {
+                self.notify_error(e);
+                return false;
+            }
+        };
+
+        // Zero-copy document source: memory-map clean files on disk, or share Arc<Vec<u8>> for edited state.
+        let doc_source = if !doc.dirty
+            && let Some(ref path) = doc.path
+            && let Ok(mmap_src) = SharedPdfSource::from_file(path)
+        {
+            mmap_src
+        } else {
+            SharedPdfSource::from_arc(doc.bytes.clone())
+        };
+
+        let mut printer_jobs = std::collections::HashMap::with_capacity(printers.len());
+        for p in &printers {
+            let mut job = self.print_draft.job_for_printer(Some(p.as_str()), &name);
+            print::add_cups_orientation(&mut job.options, &sheets);
+            printer_jobs.insert(p.clone(), job);
+        }
+        let mut default_job = self.print_draft.job_for_printer(None, &name);
+        print::add_cups_orientation(&mut default_job.options, &sheets);
+
+        let ctx = self.ctx.clone();
+        let custom_spooler: Option<SpoolSubmitFn> = match self.spooler.clone() {
+            Some(stand_in) => {
+                let sheet_count = sheets.len().max(1);
+                Some(std::sync::Arc::new(move |pdf_bytes, job, on_progress| {
+                    on_progress(sheet_count, sheet_count);
+                    let res = stand_in(pdf_bytes, job);
+                    if let Some(ref c) = ctx {
+                        c.request_repaint();
+                    }
+                    res
+                }))
+            }
+            None => ctx.map(|c| -> SpoolSubmitFn {
+                std::sync::Arc::new(move |pdf_bytes, job, on_progress| {
+                    let res = spool::submit_with_progress(pdf_bytes, job, &mut |sent, total| {
+                        on_progress(sent, total);
+                        c.request_repaint();
+                    })
+                    .map_err(|e| e.to_string());
+                    c.request_repaint();
+                    res
+                })
+            }),
+        };
+
+        let config = BatchDispatchConfig {
+            printers: printers.clone(),
+            settings,
+            doc_source,
+            page_sizes: sizes,
+            printer_jobs,
+            default_job,
+            pre_imposed_pdf: Some(std::sync::Arc::new(bytes)),
+            custom_spooler,
+        };
+
+        match PrintOrchestrationCoordinator::dispatch_batch(config) {
+            Ok(handle) => {
+                for (p_name, tel) in handle.all_telemetry() {
+                    self.print_tasks.stream_telemetry.insert(p_name.clone(), tel.clone());
+                }
+                self.print_draft.push_trace(make_trace(
+                    TraceLevel::Info,
+                    TraceCategory::Spooler,
+                    None,
+                    format!(
+                        "Dispatched cluster batch '{}' ({} sheets) across {} printers: [{}]",
+                        name,
+                        sheets.len(),
+                        printers.len(),
+                        printers.join(", ")
+                    ),
+                    None,
+                ));
+                self.print_tasks.coordinator_handles.push(handle);
+                self.show_print_progress();
+                true
+            }
+            Err(err) => {
+                let msg = format!("Cluster dispatch failed: {err}");
+                self.print_draft.push_trace(make_trace(
+                    TraceLevel::Error,
+                    TraceCategory::Spooler,
+                    None,
+                    msg.clone(),
+                    Some("CLUSTER_DISPATCH_ERR".to_string()),
+                ));
+                self.notify_error(msg);
+                false
+            }
         }
     }
 
@@ -645,14 +1127,16 @@ impl PdfCraftApp {
         }
         let Some(doc) = self.session.get(id) else { return false };
         let labels: Vec<String> = doc.info.pages.iter().map(|p| p.label.clone()).collect();
-        let settings = match self.print_draft.settings(doc.info.pages.len(), &labels) {
+        let sizes: Vec<(f64, f64)> = doc.info.pages.iter().map(|p| (f64::from(p.width), f64::from(p.height))).collect();
+        let page_count = doc.info.pages.len();
+        let name = doc.name.clone();
+        let settings = match self.print_draft.settings(page_count, &labels) {
             Ok(s) => s,
             Err(e) => {
                 self.notify_tr(&e);
                 return false;
             }
         };
-        let name = doc.name.clone();
         let bytes = match self.session.print_pdf(id, &settings) {
             Ok(b) => b,
             Err(e) => {
@@ -660,11 +1144,18 @@ impl PdfCraftApp {
                 return false;
             }
         };
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.print_draft.multi_printer_mode {
+            let sent = self.dispatch_cluster_batch(id, name, settings, bytes);
+            if sent && self.print_draft.printer.is_some() {
+                self.print_draft.remember_setup();
+            }
+            return sent;
+        }
         let to_printer = self.print_draft.printer.is_some();
         let sent = match self.print_draft.printer.clone() {
             #[cfg(target_arch = "wasm32")]
             Some(printer) if printer == crate::web_print::BROWSER_PRINTER => {
-                let sizes: Vec<(f64, f64)> = doc.info.pages.iter().map(|p| (f64::from(p.width), f64::from(p.height))).collect();
                 match print::layout(&sizes, &settings) {
                     Ok(sheets) => self.print_in_browser(name, bytes, sheets.iter().map(|s| s.size).collect()),
                     Err(e) => {
@@ -674,10 +1165,13 @@ impl PdfCraftApp {
                 }
             }
             Some(printer) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                if !self.check_spooler_disk_headroom() {
+                    return false;
+                }
                 let mut job = self.print_draft.job(&name);
                 // CUPS is told which way the sheets run (#2713), unless a driver choice already
                 // says; Windows' print ticket already is.
-                let sizes: Vec<(f64, f64)> = doc.info.pages.iter().map(|p| (f64::from(p.width), f64::from(p.height))).collect();
                 if let Ok(sheets) = print::layout(&sizes, &settings) {
                     print::add_cups_orientation(&mut job.options, &sheets);
                 }
@@ -1129,5 +1623,109 @@ mod tests {
         later.sheet = 2;
         let rasters = preview_rasters(&later, &sizes, &labels, 2.0, 8192.0);
         assert!(rasters.iter().any(|(page, _)| *page == 2));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn multi_printer_cluster_dispatches_unified_settings_and_k_only_grayscale_without_mutating_source() {
+        use pdfcraft_cos::{Dict, Document, Object, SaveOptions, Stream, write_full};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let mut cos = Document::new_empty();
+        let pages_ref = cos
+            .root()
+            .and_then(|r| cos.get(r).as_dict().and_then(|d| d.reference(b"Pages")))
+            .unwrap();
+        let mut kids = Vec::new();
+        for _ in 0..2 {
+            let stream = cos.add(Object::Stream(Stream::from_raw(
+                Dict::new(),
+                b"1 0 0 rg 40 40 150 150 re f".to_vec(),
+            )));
+            let mut page = Dict::new();
+            page.set("Type", Object::name("Page"));
+            page.set("Parent", Object::Ref(pages_ref));
+            page.set("MediaBox", Object::Array([0, 0, 595, 842].map(Object::Int).to_vec()));
+            page.set("Contents", Object::Ref(stream));
+            kids.push(Object::Ref(cos.add(Object::Dict(page))));
+        }
+        cos.update_dict(pages_ref, |d| {
+            d.set("Count", Object::Int(2));
+            d.set("Kids", Object::Array(kids));
+        })
+        .unwrap();
+        let original_pdf = write_full(&cos, &SaveOptions::default()).unwrap();
+
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.open_bytes("invoice.pdf", None, original_pdf.clone()).unwrap();
+
+        type CapturedJobs = HashMap<String, (spool::Job, Vec<u8>)>;
+        let captured: Arc<Mutex<CapturedJobs>> = Arc::new(Mutex::new(HashMap::new()));
+        let captured_cb = captured.clone();
+        app.spooler = Some(Arc::new(move |bytes, job| {
+            let printer = job.printer.clone().unwrap_or_default();
+            captured_cb
+                .lock()
+                .unwrap()
+                .insert(printer, (job.clone(), bytes.to_vec()));
+            Ok("ok".to_string())
+        }));
+
+        app.print_draft.printers = vec![
+            spool::Printer { name: "Office_HP".into(), default: true, two_sided: Some(true), description: String::new() },
+            spool::Printer { name: "Finance_Canon".into(), default: false, two_sided: Some(true), description: String::new() },
+            spool::Printer { name: "Warehouse_Simplex".into(), default: false, two_sided: Some(false), description: String::new() },
+        ];
+        app.print_draft.multi_printer_mode = true;
+        app.print_draft.selected_printers.insert("Office_HP".into());
+        app.print_draft.selected_printers.insert("Finance_Canon".into());
+        app.print_draft.selected_printers.insert("Warehouse_Simplex".into());
+        app.print_draft.copies = 3;
+        app.print_draft.collate = true;
+        app.print_draft.grayscale = true;
+        app.print_draft.duplex = Some(spool::Duplex::LongEdge);
+
+        assert!(app.print_now(), "cluster print_now must succeed");
+        assert_eq!(app.print_tasks.coordinator_handles.len(), 1);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.print_tasks.coordinator_handles.is_empty() && std::time::Instant::now() < deadline {
+            app.poll_print();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.print_tasks.coordinator_handles.is_empty(), "all cluster workers must complete");
+
+        let records = captured.lock().unwrap();
+        assert_eq!(records.len(), 3, "all 3 selected printers must receive the batch simultaneously");
+        for name in ["Office_HP", "Finance_Canon", "Warehouse_Simplex"] {
+            let (job, spooled_bytes) = records.get(name).expect(name);
+            assert_eq!(job.copies, 3);
+            assert!(job.collate);
+            assert!(job.grayscale);
+            assert!(job.grey_pages);
+            assert_eq!(job.title, "invoice.pdf");
+            assert!(!spooled_bytes.is_empty());
+        }
+        assert_eq!(records["Office_HP"].0.duplex, Some(spool::Duplex::LongEdge));
+        assert_eq!(records["Finance_Canon"].0.duplex, Some(spool::Duplex::LongEdge));
+        assert_eq!(
+            records["Warehouse_Simplex"].0.duplex, None,
+            "simplex-only printer must strip incompatible duplex flag safely"
+        );
+
+        // Verify original document bytes in session remain 100% untouched
+        let (_, doc_id) = app.active_ids().unwrap();
+        let active_doc = app.session.get(doc_id).unwrap();
+        assert_eq!(active_doc.bytes.as_slice(), original_pdf.as_slice());
+
+        // Verify diagnostic report contains all 3 printers and execution traces
+        let diag = body::collect_ui_diagnostic_report(&app.print_draft);
+        assert_eq!(diag.printers.len(), 3);
+        assert_eq!(diag.applied_tickets.len(), 3);
+        assert!(!diag.execution_traces.is_empty());
+        let md = diag.to_markdown_table();
+        assert!(md.contains("Office_HP") && md.contains("Finance_Canon") && md.contains("Warehouse_Simplex"));
     }
 }
