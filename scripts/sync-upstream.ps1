@@ -182,7 +182,9 @@ try {
     $VersionedZip = Join-Path $DistDir "pdfcraft-$VersionNumber-windows-x64-portable.zip"
     if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
     if (Test-Path $VersionedZip) { Remove-Item $VersionedZip -Force }
-    Compress-Archive -Path (Join-Path $PortableDir "*") -DestinationPath $ZipPath -Force
+    # Exclude runtime user data/cache (PdfCraftData) from distributable ZIP archives
+    $CleanItems = Get-ChildItem -Path $PortableDir | Where-Object { $_.Name -ne "PdfCraftData" } | Select-Object -ExpandProperty FullName
+    Compress-Archive -Path $CleanItems -DestinationPath $ZipPath -Force
     Copy-Item -Path $ZipPath -Destination $VersionedZip -Force
 
     $Hash = (Get-FileHash -Path $VersionedZip -Algorithm SHA256).Hash.ToLowerInvariant()
