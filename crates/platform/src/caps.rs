@@ -133,6 +133,17 @@ pub fn query_raw_gdi_caps(printer_name: &str) -> Result<RawGdiCaps, DriverError>
         PHYSICALOFFSETY, PHYSICALWIDTH, VERTRES, to_wide,
     };
 
+    if !printer_name.starts_with(r"\\")
+        && !pdfcraft_print::spool::printer_queues()
+            .iter()
+            .any(|q| q.name.eq_ignore_ascii_case(printer_name))
+    {
+        return Err(DriverError::DeviceContextFailed(format!(
+            "CreateDCW failed for printer '{}'",
+            printer_name
+        )));
+    }
+
     let wide_name = to_wide(printer_name);
     let driver_name = to_wide("WINSPOOL");
 

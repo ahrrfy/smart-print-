@@ -12,6 +12,184 @@ enum Office {
     Refuse,
 }
 
+/// Thread-safe detached snapshot of an open document's printable state, captured in O(1) on the
+/// caller thread so heavy imposition, decryption, layer resolution, signature layer rendering, or
+/// rasterization can execute on a background worker thread without blocking UI frames.
+#[derive(Clone)]
+struct DetachedPrintSnapshot {
+    editor_cos: Option<pdfcraft_cos::Document>,
+    bytes: Arc<Vec<u8>>,
+    password: Option<String>,
+    export_source: crate::export::ExportSource,
+    info_layers: Vec<pdfcraft_render::Layer>,
+    has_config_layers: bool,
+    signatures: Arc<Vec<crate::SignatureInfo>>,
+    captions: Arc<crate::StatusCaptions>,
+    low_res_required: bool,
+}
+
+impl DetachedPrintSnapshot {
+    fn capture(session: &Session, id: DocId) -> Result<Self, EditError> {
+        let doc = session.get(id).ok_or(EditError::NoDocument)?;
+        if !doc.allows_printing() {
+            return Err(EditError::NotPermitted("printing"));
+        }
+        Ok(Self {
+            editor_cos: doc.editor.as_ref().map(|e| e.cos.clone()),
+            bytes: doc.bytes.clone(),
+            password: doc.password.clone(),
+            export_source: doc.export_source(),
+            info_layers: doc.info.layers.clone(),
+            has_config_layers: !doc.config.layers.is_empty(),
+            signatures: doc.signatures.clone(),
+            captions: doc.captions.clone(),
+            low_res_required: doc.permissions().is_some_and(|p| !p.print_high_quality()),
+        })
+    }
+
+    fn build_pdf(&self, settings: &print::Settings) -> Result<Vec<u8>, EditError> {
+        let low_res = self.low_res_required.then(|| print::Raster {
+            dpi: settings.raster.as_ref().map_or(LOW_RESOLUTION_PRINT_DPI, |r| {
+                r.dpi.min(LOW_RESOLUTION_PRINT_DPI)
+            }),
+            grayscale: settings.raster.as_ref().is_some_and(|r| r.grayscale),
+            colour: settings.raster.as_ref().and_then(|r| r.colour.clone()),
+        });
+        if let Some(raster) = low_res.as_ref().or(settings.raster.as_ref()) {
+            return self.build_raster_pdf(settings, raster);
+        }
+        self.build_vector_pdf(settings)
+    }
+
+    fn build_raster_pdf(
+        &self,
+        settings: &print::Settings,
+        raster: &print::Raster,
+    ) -> Result<Vec<u8>, EditError> {
+        let mut distinct: Vec<usize> = Vec::new();
+        for &p in &settings.pages {
+            if !distinct.contains(&p) {
+                distinct.push(p);
+            }
+        }
+        let bytes = self
+            .rasterize_detached(&distinct, raster, settings.content)
+            .map_err(EditError::Print)?;
+        let pictures = pdfcraft_cos::Document::open(Arc::new(bytes))
+            .map_err(|e| EditError::Print(e.to_string()))?;
+        let remapped = print::Settings {
+            pages: settings
+                .pages
+                .iter()
+                .map(|p| distinct.iter().position(|d| d == p).unwrap_or(0))
+                .collect(),
+            content: print::Content::Document,
+            raster: None,
+            ..settings.clone()
+        };
+        print::impose(&pictures, &remapped).map_err(|e| EditError::Print(e.to_string()))
+    }
+
+    fn build_vector_pdf(&self, settings: &print::Settings) -> Result<Vec<u8>, EditError> {
+        let mut cos = match self.editor_cos.as_ref() {
+            Some(c) => c.clone(),
+            None => pdfcraft_cos::Document::open_with_password(
+                self.bytes.clone(),
+                self.password.as_deref(),
+            )
+            .map_err(|e| EditError::Write(e.to_string()))?,
+        };
+        if let Some(displayed) = guard(|| crate::document::as_displayed(&cos)).ok().flatten() {
+            cos = displayed;
+        }
+        if let Some(printed) = print_layer_states(&cos, &self.info_layers) {
+            set_default_layer_state(&mut cos, &printed);
+        } else if self.has_config_layers {
+            set_default_layer_state(&mut cos, &self.info_layers);
+        }
+        if self.signatures.iter().any(|s| s.verdict_shown) {
+            let _ = pdfcraft_sign::show_status_layers(
+                &mut cos,
+                &mut self.signatures.to_vec(),
+                &self.captions,
+            );
+        }
+        print::impose(&cos, settings).map_err(|e| EditError::Print(e.to_string()))
+    }
+
+    fn rasterize_detached(
+        &self,
+        pages: &[usize],
+        raster: &print::Raster,
+        content: print::Content,
+    ) -> Result<Vec<u8>, String> {
+        let dpi = raster.dpi.clamp(72.0, 600.0);
+        let mut config = self.export_source.config.clone();
+        config.hide_comments = false;
+        config.for_print = true;
+        let (printed, layers) =
+            guard(|| -> Result<(Vec<u8>, Option<Vec<pdfcraft_render::Layer>>), String> {
+                let mut cos = pdfcraft_cos::Document::open_with_password(
+                    self.export_source.bytes.clone(),
+                    config.password.as_deref(),
+                )
+                .map_err(|e| e.to_string())?;
+                print::keep_printed(&mut cos, content);
+                let layers = print_layer_states(&cos, &self.info_layers);
+                let written =
+                    pdfcraft_cos::write_incremental(&cos, &SaveOptions::default())
+                        .map_err(|e| e.to_string())?;
+                Ok((written, layers))
+            })??;
+        if let Some(layers) = layers {
+            config.layers = Arc::new(
+                layers
+                    .iter()
+                    .map(|l| (l.id.0 as i32, l.id.1 as i32, l.visible))
+                    .collect(),
+            );
+        }
+        let mut renderer = pdfcraft_render::PageRenderer::new(Arc::new(printed), config);
+        let mut images: Vec<(String, Vec<u8>)> = Vec::with_capacity(pages.len());
+        let mut used: Option<f64> = None;
+        for &page in pages {
+            let (w, h) = self
+                .export_source
+                .sizes
+                .get(page)
+                .copied()
+                .ok_or_else(|| format!("page {} does not exist", page + 1))?;
+            let scale = pdfcraft_render::effective_scale(w, h, (dpi / 72.0) as f32);
+            let page_dpi = f64::from(scale) * 72.0;
+            used = Some(used.map_or(page_dpi, |u: f64| u.min(page_dpi)));
+            let r = renderer.render(pdfcraft_render::RenderRequest {
+                page,
+                scale,
+                tag: pdfcraft_render::PRINT_TAG,
+                ..Default::default()
+            });
+            if let Some(e) = r.error {
+                return Err(format!("page {}: {e}", page + 1));
+            }
+            let mut rgba = r.rgba.to_vec();
+            print_raster::over_white(&mut rgba, raster.grayscale);
+            if let Some(colour) = &raster.colour {
+                colour
+                    .convert(&mut rgba)
+                    .map_err(|e| format!("page {}: {e}", page + 1))?;
+            }
+            images.push((
+                format!("page-{}.png", page + 1),
+                crate::export::encode_png(r.width, r.height, &rgba)?,
+            ));
+        }
+        let final_dpi = used.unwrap_or(dpi);
+        let doc = pdfcraft_create::from_images_with_resolution(&images, ImageResolution::Dpi(final_dpi))
+            .map_err(|e| e.to_string())?;
+        write_full(&doc, &SaveOptions::default()).map_err(|e| e.to_string())
+    }
+}
+
 impl Session {
     /// The page count of another PDF (Replace Pages, Insert Pages dialogs).
     pub fn page_count_of(&self, name: &str, bytes: &Arc<Vec<u8>>) -> Result<usize, EditError> {
@@ -227,67 +405,21 @@ impl Session {
         guard(|| pdfcraft_xfdf::export_xfdf_comments(&cos, which, &doc.name)).map_err(EditError::Write)
     }
 
+    /// Captures a thread-safe snapshot of `id`'s printable state in O(1) so heavy imposition or
+    /// rasterization can execute on a background worker thread without blocking the UI frame loop.
+    pub fn prepare_print_pdf(
+        &self,
+        id: DocId,
+    ) -> Result<crate::print_coordinator::PreparedPrintSource, EditError> {
+        let snapshot = DetachedPrintSnapshot::capture(self, id)?;
+        Ok(crate::print_coordinator::PreparedPrintSource::from_builder(
+            move |settings| snapshot.build_pdf(settings).map_err(|e| e.to_string()),
+        ))
+    }
+
     /// The print-ready PDF for `settings` (sheets laid out for the paper; see `pdfcraft-print`).
     pub fn print_pdf(&self, id: DocId, settings: &print::Settings) -> Result<Vec<u8>, EditError> {
-        let doc = self.get(id).ok_or(EditError::NoDocument)?;
-        if !doc.allows_printing() {
-            return Err(EditError::NotPermitted("printing"));
-        }
-        // Table 22, bit 12 clear: only a low-level representation may be printed, so the pages
-        // always go as pictures, at no more than the low resolution.
-        let low_res = doc.permissions().is_some_and(|p| !p.print_high_quality()).then(|| print::Raster {
-            dpi: settings.raster.as_ref().map_or(LOW_RESOLUTION_PRINT_DPI, |r| r.dpi.min(LOW_RESOLUTION_PRINT_DPI)),
-            grayscale: settings.raster.as_ref().is_some_and(|r| r.grayscale),
-            colour: settings.raster.as_ref().and_then(|r| r.colour.clone()),
-        });
-        // Print as image: the pages used become pictures first, then the picture document is
-        // imposed in their place (its page k is the k-th distinct source page used).
-        if let Some(raster) = low_res.as_ref().or(settings.raster.as_ref()) {
-            let mut distinct: Vec<usize> = Vec::new();
-            for &p in &settings.pages {
-                if !distinct.contains(&p) {
-                    distinct.push(p);
-                }
-            }
-            let bytes = print_raster::rasterize(doc, &distinct, raster, settings.content).map_err(EditError::Print)?;
-            let pictures = pdfcraft_cos::Document::open(Arc::new(bytes)).map_err(|e| EditError::Print(e.to_string()))?;
-            let remapped = print::Settings {
-                pages: settings.pages.iter().map(|p| distinct.iter().position(|d| d == p).unwrap_or(0)).collect(),
-                content: print::Content::Document,
-                raster: None,
-                ..settings.clone()
-            };
-            return pdfcraft_print::impose(&pictures, &remapped).map_err(|e| EditError::Print(e.to_string()));
-        }
-        let mut cos = match doc.editor.as_ref() {
-            Some(e) => e.cos.clone(),
-            None => {
-                pdfcraft_cos::Document::open_with_password(doc.bytes.clone(), doc.password.as_deref()).map_err(|e| EditError::Write(e.to_string()))?
-            }
-        };
-        // Comments and fields without an appearance print as the page shows them (and as Print
-        // as Image already printed them): the vector print drew only appearance streams, so a
-        // text box without one was on screen but not on paper. ISO 32000-2 §12.5.3: an
-        // annotation with the Print flag is printed.
-        if let Some(displayed) = guard(|| crate::document::as_displayed(&cos)).ok().flatten() {
-            cos = displayed;
-        }
-        // #3046: the layers print as they are shown. Once the Layers panel (or a set-layer
-        // action) has changed one, the print copy's default configuration says which are on, so a
-        // hidden layer stays off on paper too; untouched, the document's own configuration prints.
-        // On top of either, the configuration's auto state for the Print event sets the layers it
-        // names (`print_layer_states`), as printing does in a viewer (ISO 32000-2 §8.11.4.4).
-        if let Some(printed) = print_layer_states(&cos, &doc.info.layers) {
-            set_default_layer_state(&mut cos, &printed);
-        } else if !doc.config.layers.is_empty() {
-            set_default_layer_state(&mut cos, &doc.info.layers);
-        }
-        // Signature states as the screen shows them, so not when its display copy could not be
-        // written. This copy is only printed, never saved.
-        if doc.signatures.iter().any(|s| s.verdict_shown) {
-            let _ = pdfcraft_sign::show_status_layers(&mut cos, &mut doc.signatures.to_vec(), &doc.captions);
-        }
-        pdfcraft_print::impose(&cos, settings).map_err(|e| EditError::Print(e.to_string()))
+        DetachedPrintSnapshot::capture(self, id)?.build_pdf(settings)
     }
 
     /// For each page, whether its text mostly runs bottom-to-top ([`pdfcraft_print::text_reads_up`]);

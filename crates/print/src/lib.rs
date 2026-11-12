@@ -72,7 +72,12 @@ use sheets::text_direction;
 pub use sheets::{
     LABEL_MARGIN, MARGIN, MAX_CREEP, Placement, Sheet, add_cups_orientation, cups_orientation, layout, matching_paper, text_reads_up, texts_read_up,
 };
-pub use spool::{open_printer_preferences, printer_default_paper, printer_paper_info, printer_papers, show_printer_properties};
+pub use spool::{
+    CapturedDriverTemplate, OPT_COLOR_INTENT, OPT_ORIENTATION, OPT_PAPER_UM, WindowsUnifiedBridge,
+    capture_driver_template, is_virtual_save_printer, open_printer_preferences,
+    printer_default_paper, printer_paper_info, printer_papers, register_windows_unified_bridge,
+    set_job_broadcast_specs, show_printer_properties, with_ticket_provider_lock,
+};
 
 /// The names of the Print dialog's choices, shared by the `doc_print` tool and the settings
 /// file, so a saved preference reads like a tool argument and there is one vocabulary to keep.

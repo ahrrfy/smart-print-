@@ -11,19 +11,12 @@ use pdfcraft_print::driver::{
     ColorMode, DriverError, DriverGeneration, DuplexBinding, PreFlightReport,
     PrintDriverAdapter, PrintJobSettings, PrinterCapabilities, SpoolSummary,
 };
-use std::sync::Mutex;
 
-/// Global process-wide mutex protecting vendor PrintTicket provider DLLs
-/// from concurrent multithreaded access.
-static PRINT_TICKET_PROVIDER: Mutex<()> = Mutex::new(());
-
+/// Execute `f` while holding the shared process-wide PrintTicket provider lock from `pdfcraft-print`.
 pub fn with_print_ticket_provider<T, F: FnOnce() -> Result<T, DriverError>>(
     f: F,
 ) -> Result<T, DriverError> {
-    let _guard = PRINT_TICKET_PROVIDER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    f()
+    pdfcraft_print::spool::with_ticket_provider_lock(f)
 }
 
 pub const S_OK: i32 = 0;
@@ -106,53 +99,6 @@ pub fn generate_delta_print_ticket_xml(
     xml
 }
 
-#[cfg(windows)]
-#[allow(non_snake_case, dead_code, clippy::upper_case_acronyms)]
-mod ffi {
-    use std::ffi::c_void;
-
-    pub type HPTPROVIDER = isize;
-    pub type HRESULT = i32;
-
-    pub type FnPTOpenProvider = unsafe extern "system" fn(
-        pszPrinterName: *const u16,
-        dwVersion: u32,
-        phProvider: *mut HPTPROVIDER,
-    ) -> HRESULT;
-
-    pub type FnPTCloseProvider = unsafe extern "system" fn(hProvider: HPTPROVIDER) -> HRESULT;
-
-    pub type FnPTMergeAndValidatePrintTicket = unsafe extern "system" fn(
-        hProvider: HPTPROVIDER,
-        pBaseTicket: *mut c_void,
-        pDeltaTicket: *mut c_void,
-        scope: i32,
-        pResultTicket: *mut c_void,
-        pbstrErrorMessage: *mut *mut u16,
-    ) -> HRESULT;
-
-    pub type FnSHCreateMemStream =
-        unsafe extern "system" fn(pInit: *const u8, cbInit: u32) -> *mut c_void;
-
-    pub struct PrntVptFunctions {
-        pub open_provider: FnPTOpenProvider,
-        pub close_provider: FnPTCloseProvider,
-        pub merge_ticket: FnPTMergeAndValidatePrintTicket,
-        pub create_stream: FnSHCreateMemStream,
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        pub fn LoadLibraryW(lpLibFileName: *const u16) -> *mut c_void;
-        pub fn GetProcAddress(hModule: *mut c_void, lpProcName: *const u8) -> *mut c_void;
-        pub fn FreeLibrary(hModule: *mut c_void) -> i32;
-    }
-
-    pub fn to_wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-}
-
 /// Win32 V4 XPS PrintTicket Driver Adapter.
 #[derive(Clone, Debug, Default)]
 pub struct Win32V4Adapter;
@@ -162,183 +108,35 @@ impl Win32V4Adapter {
         Self
     }
 
-    /// Merges user print settings into a validated PrintTicket XML string.
+    /// Merges user print settings into a validated PrintTicket XML string (`kPTJobScope = 2`)
+    /// with deterministic COM `IStream` and `BSTR` cleanup.
     pub fn merge_print_ticket(
         &self,
         printer_name: &str,
         settings: &PrintJobSettings,
     ) -> Result<String, DriverError> {
-        with_print_ticket_provider(|| {
-            let delta_xml = generate_delta_print_ticket_xml(
-                settings.color_mode,
-                settings.duplex_mode,
-                settings.landscape,
-                settings.copies,
-                settings.paper_name.as_deref(),
-            );
+        let delta_xml = generate_delta_print_ticket_xml(
+            settings.color_mode,
+            settings.duplex_mode,
+            settings.landscape,
+            settings.copies,
+            settings.paper_name.as_deref(),
+        );
 
-            #[cfg(windows)]
-            {
-                use ffi::{
-                    FnPTCloseProvider, FnPTMergeAndValidatePrintTicket, FnPTOpenProvider,
-                    FnSHCreateMemStream, FreeLibrary, GetProcAddress, HPTPROVIDER, LoadLibraryW,
-                    to_wide,
-                };
-                // Validate that prntvpt.dll can be loaded
-                let prntvpt_name = to_wide("prntvpt.dll");
-                let shlwapi_name = to_wide("shlwapi.dll");
+        #[cfg(windows)]
+        {
+            crate::win32_unified::merge_and_read_ticket_xml(
+                printer_name,
+                DEFAULT_BASE_TICKET_XML.as_bytes(),
+                delta_xml.as_bytes(),
+            )
+        }
 
-                let h_prntvpt = unsafe { LoadLibraryW(prntvpt_name.as_ptr()) };
-                if h_prntvpt.is_null() {
-                    return Err(DriverError::DllNotFound(
-                        "prntvpt.dll is not available on this system".to_string(),
-                    ));
-                }
-
-                let h_shlwapi = unsafe { LoadLibraryW(shlwapi_name.as_ptr()) };
-                if h_shlwapi.is_null() {
-                    unsafe { FreeLibrary(h_prntvpt) };
-                    return Err(DriverError::DllNotFound(
-                        "shlwapi.dll is not available on this system".to_string(),
-                    ));
-                }
-
-                let open_fn: FnPTOpenProvider = unsafe {
-                    let ptr = GetProcAddress(h_prntvpt, c"PTOpenProvider".as_ptr().cast::<u8>());
-                    if ptr.is_null() {
-                        FreeLibrary(h_prntvpt);
-                        FreeLibrary(h_shlwapi);
-                        return Err(DriverError::PrintTicketError(
-                            "PTOpenProvider symbol not found".to_string(),
-                        ));
-                    }
-                    std::mem::transmute(ptr)
-                };
-
-                let close_fn: FnPTCloseProvider = unsafe {
-                    let ptr = GetProcAddress(h_prntvpt, c"PTCloseProvider".as_ptr().cast::<u8>());
-                    if ptr.is_null() {
-                        FreeLibrary(h_prntvpt);
-                        FreeLibrary(h_shlwapi);
-                        return Err(DriverError::PrintTicketError(
-                            "PTCloseProvider symbol not found".to_string(),
-                        ));
-                    }
-                    std::mem::transmute(ptr)
-                };
-
-                let merge_fn: FnPTMergeAndValidatePrintTicket = unsafe {
-                    let ptr = GetProcAddress(
-                        h_prntvpt,
-                        c"PTMergeAndValidatePrintTicket".as_ptr().cast::<u8>(),
-                    );
-                    if ptr.is_null() {
-                        FreeLibrary(h_prntvpt);
-                        FreeLibrary(h_shlwapi);
-                        return Err(DriverError::PrintTicketError(
-                            "PTMergeAndValidatePrintTicket symbol not found".to_string(),
-                        ));
-                    }
-                    std::mem::transmute(ptr)
-                };
-
-                let create_stream_fn: FnSHCreateMemStream = unsafe {
-                    // Ordinal 12 on shlwapi or SHCreateMemStream
-                    let ptr = GetProcAddress(h_shlwapi, c"SHCreateMemStream".as_ptr().cast::<u8>());
-                    if ptr.is_null() {
-                        FreeLibrary(h_prntvpt);
-                        FreeLibrary(h_shlwapi);
-                        return Err(DriverError::PrintTicketError(
-                            "SHCreateMemStream symbol not found".to_string(),
-                        ));
-                    }
-                    std::mem::transmute(ptr)
-                };
-
-                let wide_printer = to_wide(printer_name);
-                let mut provider: HPTPROVIDER = 0;
-                let hr = unsafe { open_fn(wide_printer.as_ptr(), 1, &mut provider) };
-                if hr != S_OK || provider == 0 {
-                    unsafe {
-                        FreeLibrary(h_prntvpt);
-                        FreeLibrary(h_shlwapi);
-                    }
-                    return Err(DriverError::PrintTicketError(format!(
-                        "PTOpenProvider failed with HRESULT 0x{:08X}",
-                        hr
-                    )));
-                }
-
-                struct ProviderGuard {
-                    provider: HPTPROVIDER,
-                    close_fn: FnPTCloseProvider,
-                    h_prntvpt: *mut std::ffi::c_void,
-                    h_shlwapi: *mut std::ffi::c_void,
-                }
-                impl Drop for ProviderGuard {
-                    fn drop(&mut self) {
-                        unsafe {
-                            (self.close_fn)(self.provider);
-                            FreeLibrary(self.h_prntvpt);
-                            FreeLibrary(self.h_shlwapi);
-                        }
-                    }
-                }
-                let _guard = ProviderGuard {
-                    provider,
-                    close_fn,
-                    h_prntvpt,
-                    h_shlwapi,
-                };
-
-                // Create base stream with valid minimal ticket to avoid 0x80070057 E_INVALIDARG
-                let base_bytes = DEFAULT_BASE_TICKET_XML.as_bytes();
-                let p_base = unsafe { create_stream_fn(base_bytes.as_ptr(), base_bytes.len() as u32) };
-                if p_base.is_null() {
-                    return Err(DriverError::PrintTicketError("Failed to create base stream".into()));
-                }
-
-                let delta_bytes = delta_xml.as_bytes();
-                let p_delta = unsafe { create_stream_fn(delta_bytes.as_ptr(), delta_bytes.len() as u32) };
-                if p_delta.is_null() {
-                    return Err(DriverError::PrintTicketError("Failed to create delta stream".into()));
-                }
-
-                let p_result = unsafe { create_stream_fn(std::ptr::null(), 0) };
-                if p_result.is_null() {
-                    return Err(DriverError::PrintTicketError("Failed to create result stream".into()));
-                }
-
-                let mut err_msg: *mut u16 = std::ptr::null_mut();
-                let merge_hr = unsafe {
-                    merge_fn(
-                        provider,
-                        p_base,
-                        p_delta,
-                        1, // kPTJobScope
-                        p_result,
-                        &mut err_msg,
-                    )
-                };
-
-                // Both S_OK and S_PT_CONFLICT_RESOLVED (0x00040001) indicate successful merge
-                if merge_hr != S_OK && merge_hr != S_PT_CONFLICT_RESOLVED {
-                    return Err(DriverError::PrintTicketError(format!(
-                        "PTMergeAndValidatePrintTicket failed with HRESULT 0x{:08X}",
-                        merge_hr
-                    )));
-                }
-
-                // Merged successfully; return delta XML or resolved XML
-                Ok(delta_xml)
-            }
-
-            #[cfg(not(windows))]
-            {
-                let _ = printer_name;
-                Ok(delta_xml)
-            }
-        })
+        #[cfg(not(windows))]
+        {
+            let _ = printer_name;
+            Ok(delta_xml)
+        }
     }
 }
 
@@ -362,14 +160,6 @@ impl PrintDriverAdapter for Win32V4Adapter {
         settings: &PrintJobSettings,
         pdf_bytes: &[u8],
     ) -> Result<SpoolSummary, DriverError> {
-        // Validate and merge PrintTicket
-        let _ticket_xml = self.merge_print_ticket(&settings.printer_name, settings)?;
-
-        // Return spool summary
-        Ok(SpoolSummary {
-            job_id: 1,
-            pages_spooled: 1,
-            bytes_written: pdf_bytes.len(),
-        })
+        crate::win32_unified::spool_driver_job(settings, pdf_bytes)
     }
 }

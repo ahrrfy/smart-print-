@@ -1,6 +1,6 @@
 //! The print-ready PDF as the system spooler gets it.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use pdfcraft_cos::{Dict, Object, SaveOptions, Stream, write_full};
 use pdfcraft_render::{PRINT_TAG, PageRenderer, RenderConfig, RenderRequest, Tile};
@@ -66,6 +66,158 @@ pub fn spooler_copy(bytes: Vec<u8>, job: &mut crate::print::spool::Job, flatten_
     }
     // Once `tiled` returns, its document is gone and `bytes` is the only owner left: no copy.
     tiled(bytes.clone()).unwrap_or_else(|| Arc::try_unwrap(bytes).unwrap_or_else(|shared| (*shared).clone()))
+}
+
+/// Converts `bytes` once into a unified grayscale + K-only PDF without inflating JPEG streams to
+/// `FlateDecode`:
+/// 1. [`greyed`] converts page/annotation/field colours and re-encodes raster images (`JPEG` stays
+///    compact `DCTDecode` in `DeviceGray`; `Indexed`, 1/2/4-bit, `ICCBased`, `CalRGB`, and `PNG`
+///    become `DeviceGray`).
+/// 2. [`pdfcraft_print::monochrome::MonochromeVectorFilter::filter_document_to_k_only`] rewrites
+///    inline images (`BI..ID..EI`), nested Form XObjects, transparency group colour spaces, and
+///    remaining vector colour operators to pure K-only (`DeviceGray` / `0 0 0 K_eff`), leaving
+///    already-grey `DCTDecode` images untouched.
+///
+/// Returns `None` only when `bytes` cannot be opened as a PDF.
+pub fn monochrome_k_only(bytes: Arc<Vec<u8>>) -> Option<Arc<Vec<u8>>> {
+    let stage1 = match greyed(bytes.clone()) {
+        Some(Some(grey)) => Arc::new(grey),
+        Some(None) => bytes,
+        None => return None,
+    };
+    let filtered = guard(|| {
+        pdfcraft_print::monochrome::MonochromeVectorFilter::filter_document_to_k_only(&stage1).ok()
+    })
+    .ok()
+    .flatten();
+    Some(filtered.map_or(stage1, Arc::new))
+}
+
+/// Shared zero-copy spool buffer cache across concurrent workers in a multi-printer batch.
+///
+/// Ensures grayscale/K-only conversion, large-image tiling, and 300 DPI GDI transparency
+/// flattening each execute at most once per batch rather than duplicating heavy buffers per worker.
+pub struct SharedSpoolBuffer {
+    base: Arc<Vec<u8>>,
+    color_tiled: OnceLock<Arc<Vec<u8>>>,
+    color_flattened: OnceLock<Arc<Vec<u8>>>,
+    mono_tiled: OnceLock<Option<Arc<Vec<u8>>>>,
+    mono_flattened: OnceLock<Option<Arc<Vec<u8>>>>,
+}
+
+impl SharedSpoolBuffer {
+    pub fn new(base: Arc<Vec<u8>>) -> Self {
+        Self {
+            base,
+            color_tiled: OnceLock::new(),
+            color_flattened: OnceLock::new(),
+            mono_tiled: OnceLock::new(),
+            mono_flattened: OnceLock::new(),
+        }
+    }
+
+    /// Underlying imposed print-ready PDF prior to per-driver spool adaptations.
+    pub fn base(&self) -> &Arc<Vec<u8>> {
+        &self.base
+    }
+
+    fn tile_for_platform(bytes: Arc<Vec<u8>>) -> Arc<Vec<u8>> {
+        if cfg!(windows) {
+            tiled(bytes.clone()).map_or(bytes, Arc::new)
+        } else {
+            bytes
+        }
+    }
+
+    fn color_ready(&self) -> &Arc<Vec<u8>> {
+        self.color_tiled
+            .get_or_init(|| Self::tile_for_platform(self.base.clone()))
+    }
+
+    fn mono_ready(&self) -> Option<&Arc<Vec<u8>>> {
+        self.mono_tiled
+            .get_or_init(|| monochrome_k_only(self.base.clone()).map(Self::tile_for_platform))
+            .as_ref()
+    }
+
+    /// Returns a zero-copy `Arc<Vec<u8>>` ready for OS spooling for `job`, updating `job.grey_pages`
+    /// when monochrome conversion succeeded and sharing GDI-flattened output via `OnceLock`.
+    pub fn for_job(&self, job: &mut crate::print::spool::Job, flatten_transparency: bool) -> Arc<Vec<u8>> {
+        if job.grayscale {
+            if flatten_transparency && cfg!(windows) {
+                let flat_opt = self.mono_flattened.get_or_init(|| {
+                    let mono = self.mono_ready()?.clone();
+                    let out = flattened(mono.clone(), FLATTEN_DPI)
+                        .map(|f| Self::tile_for_platform(Arc::new(f)))
+                        .unwrap_or(mono);
+                    Some(out)
+                });
+                if let Some(buf) = flat_opt {
+                    job.grey_pages = true;
+                    return buf.clone();
+                }
+            } else if let Some(mono) = self.mono_ready() {
+                job.grey_pages = true;
+                return mono.clone();
+            }
+        }
+
+        if flatten_transparency && cfg!(windows) {
+            return self
+                .color_flattened
+                .get_or_init(|| {
+                    flattened(self.base.clone(), FLATTEN_DPI)
+                        .map(|f| Self::tile_for_platform(Arc::new(f)))
+                        .unwrap_or_else(|| self.color_ready().clone())
+                })
+                .clone();
+        }
+
+        self.color_ready().clone()
+    }
+
+    /// Slices `sheet_indices` (0-based pages of the imposed PDF) for failover rerouting via
+    /// [`pdfcraft_organize::extract_pages`], preserving encryption output, form/comment appearances,
+    /// Poster/Booklet layouts, and cached grayscale conversion without re-imposing from raw source.
+    pub fn slice_sheets(
+        &self,
+        sheet_indices: &[usize],
+        job: &mut crate::print::spool::Job,
+        flatten_transparency: bool,
+    ) -> Result<Arc<Vec<u8>>, String> {
+        let (source_arc, grey_converted) = if job.grayscale {
+            match self.mono_ready() {
+                Some(mono) => (mono.clone(), true),
+                None => (self.color_ready().clone(), false),
+            }
+        } else {
+            (self.color_ready().clone(), false)
+        };
+
+        let doc = pdfcraft_cos::Document::open(source_arc)
+            .map_err(|e| format!("Failed to open imposed PDF for failover slice: {e}"))?;
+        let total = pdfcraft_model::pages(&doc).len();
+        if sheet_indices.len() == total && sheet_indices.iter().copied().eq(0..total) {
+            return Ok(self.for_job(job, flatten_transparency));
+        }
+
+        let sliced_doc = pdfcraft_organize::extract_pages(&doc, sheet_indices)
+            .map_err(|e| format!("Failed to slice remaining imposed sheets: {e}"))?;
+        let sliced_bytes = write_full(&sliced_doc, &SaveOptions::default())
+            .map_err(|e| format!("Failed to serialize sliced failover PDF: {e}"))?;
+        let mut out = Arc::new(sliced_bytes);
+
+        if grey_converted {
+            job.grey_pages = true;
+        }
+        if flatten_transparency
+            && cfg!(windows)
+            && let Some(flat) = flattened(out.clone(), FLATTEN_DPI)
+        {
+            out = Self::tile_for_platform(Arc::new(flat));
+        }
+        Ok(out)
+    }
 }
 
 /// `bytes` with every colour on every page, its comments and form fields included, turned grey by

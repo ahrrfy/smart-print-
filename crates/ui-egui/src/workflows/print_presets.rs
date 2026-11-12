@@ -74,6 +74,7 @@ pub enum PresetDuplex {
     Simplex,
     LongEdge,
     ShortEdge,
+    PrinterDefault,
 }
 
 /// Page orientation rule for preset configurations.
@@ -109,6 +110,12 @@ pub struct PrintJobPreset {
     pub fit_mode: PresetFitMode,
     pub custom_scale_pct: Option<f32>,
     pub collate: bool,
+    /// Optional canonical or custom paper label (e.g. `"A4"`, `"US Letter"`).
+    #[serde(default)]
+    pub paper_label: Option<String>,
+    /// Optional exact paper dimensions in micrometers `(width_um, height_um)` (e.g. `(210_000, 297_000)`).
+    #[serde(default)]
+    pub paper_size_um: Option<(u32, u32)>,
 }
 
 impl PrintJobPreset {
@@ -126,7 +133,16 @@ impl PrintJobPreset {
             fit_mode: PresetFitMode::default(),
             custom_scale_pct: None,
             collate: true,
+            paper_label: None,
+            paper_size_um: None,
         }
+    }
+
+    /// Attaches an explicit unified paper specification to this preset.
+    pub fn with_paper(mut self, label: impl Into<String>, size_um: (u32, u32)) -> Self {
+        self.paper_label = Some(label.into());
+        self.paper_size_um = Some(size_um);
+        self
     }
 }
 
@@ -141,6 +157,7 @@ pub struct PrintPresetStore {
 
 impl PrintPresetStore {
     /// Initializes store with the three standard production presets.
+    /// `active_preset_id` starts as `None` ("Custom Setup") until a preset is explicitly chosen.
     pub fn with_defaults() -> Self {
         let mut store = Self::default();
 
@@ -156,6 +173,8 @@ impl PrintPresetStore {
             fit_mode: PresetFitMode::FitToPrintable,
             custom_scale_pct: None,
             collate: true,
+            paper_label: None,
+            paper_size_um: None,
         };
 
         let monochrome_eco = PrintJobPreset {
@@ -170,6 +189,8 @@ impl PrintPresetStore {
             fit_mode: PresetFitMode::FitToPrintable,
             custom_scale_pct: None,
             collate: true,
+            paper_label: None,
+            paper_size_um: None,
         };
 
         let engineering_100 = PrintJobPreset {
@@ -184,12 +205,14 @@ impl PrintPresetStore {
             fit_mode: PresetFitMode::ActualSize100,
             custom_scale_pct: None,
             collate: true,
+            paper_label: None,
+            paper_size_um: None,
         };
 
         store.upsert_preset(standard_duplex);
         store.upsert_preset(monochrome_eco);
         store.upsert_preset(engineering_100);
-        store.active_preset_id = Some("standard-duplex".to_string());
+        store.active_preset_id = None;
 
         store
     }
@@ -328,7 +351,7 @@ mod tests {
         assert!(store.presets.contains_key("standard-duplex"));
         assert!(store.presets.contains_key("monochrome-eco"));
         assert!(store.presets.contains_key("engineering-100"));
-        assert_eq!(store.active_preset_id.as_deref(), Some("standard-duplex"));
+        assert_eq!(store.active_preset_id, None, "defaults start unchosen (Custom Setup)");
 
         let standard = store.get_preset("standard-duplex").expect("must exist");
         assert!(standard.is_built_in);
@@ -366,17 +389,41 @@ mod tests {
             fit_mode: PresetFitMode::CustomScale(95.0),
             custom_scale_pct: Some(95.0),
             collate: false,
+            paper_label: Some("A4".to_string()),
+            paper_size_um: Some((210_000, 297_000)),
         };
 
         store.upsert_preset(custom);
         assert_eq!(store.presets.len(), 4);
         store.set_active_preset(Some("custom-2up".to_string()));
         assert_eq!(store.active_preset().map(|p| p.name.as_str()), Some("2-Up Booklet Test"));
+        assert_eq!(store.active_preset().and_then(|p| p.paper_label.as_deref()), Some("A4"));
+        assert_eq!(store.active_preset().and_then(|p| p.paper_size_um), Some((210_000, 297_000)));
 
         let deleted = store.delete_preset("custom-2up");
         assert!(deleted);
         assert_eq!(store.presets.len(), 3);
         assert!(store.active_preset().is_none());
+    }
+
+    #[test]
+    fn test_legacy_preset_json_without_paper_fields_deserializes() {
+        let legacy_json = r#"{
+            "id": "legacy-1",
+            "name": "Legacy Preset",
+            "description": "Saved before paper fields existed",
+            "is_built_in": false,
+            "copies": 1,
+            "color_mode": "Color",
+            "duplex": "LongEdge",
+            "orientation": "Auto",
+            "fit_mode": "FitToPrintable",
+            "custom_scale_pct": null,
+            "collate": true
+        }"#;
+        let parsed: PrintJobPreset = serde_json::from_str(legacy_json).expect("legacy preset must parse");
+        assert_eq!(parsed.paper_label, None);
+        assert_eq!(parsed.paper_size_um, None);
     }
 
     #[test]

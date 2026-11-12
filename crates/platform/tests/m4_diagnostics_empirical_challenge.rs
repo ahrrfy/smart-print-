@@ -354,6 +354,8 @@ fn challenge_4_preset_store_deletion_protection_and_persistence() {
         fit_mode: PresetFitMode::ShrinkOversized,
         custom_scale_pct: None,
         collate: true,
+        paper_label: None,
+        paper_size_um: None,
     };
     store.upsert_preset(custom);
     store.set_active_preset(Some("label-run".to_string()));

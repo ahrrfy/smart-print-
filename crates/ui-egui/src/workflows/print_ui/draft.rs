@@ -1,6 +1,7 @@
-use super::setups::{self, PrinterSetup};
+use super::setups::{self, BroadcastSetup, PrinterSetup};
 use super::{Binding, BookletSubset, Content, Layout, Orientation, PageOrder, SizeMode, Subset, print, spool};
 use pdfcraft_engine::print::PAPERS;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Which {
@@ -23,11 +24,80 @@ pub enum Handling {
     Label,
 }
 
+/// Explicit color intent enforced across all target printers during broadcast printing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ColorIntent {
+    #[default]
+    Color,
+    Monochrome,
+}
+
+/// Summary of the unified specifications and hardware adaptations applied to one target printer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrinterBroadcastSummary {
+    pub printer_name: String,
+    pub is_installed: bool,
+    pub is_virtual_save_printer: bool,
+    pub is_default: bool,
+    pub paper_name: String,
+    pub paper_size_pt: (f64, f64),
+    pub paper_size_um: (u32, u32),
+    pub color_intent: ColorIntent,
+    pub requested_duplex: Option<spool::Duplex>,
+    pub effective_duplex: Option<spool::Duplex>,
+    pub duplex_fallback_to_simplex: bool,
+    pub orientation: Orientation,
+    pub size_mode: SizeMode,
+    pub copies: u32,
+    pub collate: bool,
+}
+
+/// Standard paper names offered as 1-click quick pills in the Unified Broadcast Specs pane.
+pub const QUICK_STANDARD_PAPERS: [&str; 5] = ["A4", "A3", "US Letter", "US Legal", "A5"];
+
 /// The percent a custom scale can be (the dialog's field and a saved setting).
 pub const CUSTOM_SCALE: std::ops::RangeInclusive<f64> = 1.0..=1000.0;
 
 /// The resolutions the Print dialog offers for Print as image, in dots per inch.
 pub const IMAGE_DPI: [f64; 3] = [150.0, 300.0, 600.0];
+
+/// Converts Typographic points (`1/72 in`) to micrometers (`1 µm = 1/25_400 in`).
+pub fn points_to_um(pt: f64) -> u32 {
+    if !pt.is_finite() || pt <= 0.0 {
+        return 0;
+    }
+    ((pt * 25_400.0) / 72.0).round() as u32
+}
+
+/// Converts micrometers (`1 µm = 1/25_400 in`) to Typographic points (`1/72 in`).
+pub fn um_to_points(um: u32) -> f64 {
+    (f64::from(um) * 72.0) / 25_400.0
+}
+
+type CanonicalPaperEntry = (&'static str, (f64, f64), (u32, u32));
+
+fn canonical_paper_um(name: &str, size_pt: (f64, f64)) -> (u32, u32) {
+    let known: &[CanonicalPaperEntry] = &[
+        ("A4", (595.28, 841.89), (210_000, 297_000)),
+        ("A3", (841.89, 1190.55), (297_000, 420_000)),
+        ("A5", (419.53, 595.28), (148_000, 210_000)),
+        ("B4", (708.66, 1000.63), (250_000, 353_000)),
+        ("B5", (498.90, 708.66), (176_000, 250_000)),
+        ("US Letter", (612.0, 792.0), (215_900, 279_400)),
+        ("US Legal", (612.0, 1008.0), (215_900, 355_600)),
+        ("Legal", (612.0, 1008.0), (215_900, 355_600)),
+        ("Tabloid", (792.0, 1224.0), (279_400, 431_800)),
+        ("Executive", (522.0, 756.0), (184_150, 266_700)),
+        ("Statement", (396.0, 612.0), (139_700, 215_900)),
+        ("4 x 6 in label (101.6 x 152.4 mm)", (288.0, 432.0), (101_600, 152_400)),
+    ];
+    for &(canon, ref_pt, exact_um) in known {
+        if name == canon && (size_pt.0 - ref_pt.0).abs() <= 1.0 && (size_pt.1 - ref_pt.1).abs() <= 1.0 {
+            return exact_um;
+        }
+    }
+    (points_to_um(size_pt.0), points_to_um(size_pt.1))
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PrintDraft {
@@ -94,7 +164,7 @@ pub struct PrintDraft {
     /// The printer driver's own options and the printer they were read for (Properties…, CUPS).
     pub driver_options: Option<(String, Vec<spool::PrinterOption>)>,
     /// Driver options set away from the printer's defaults, for `driver_options`' printer.
-    pub driver_choices: std::collections::BTreeMap<String, String>,
+    pub driver_choices: BTreeMap<String, String>,
     pub show_driver_options: bool,
     /// Why the printer's preferences window didn't open (Windows).
     pub driver_error: Option<String>,
@@ -116,16 +186,16 @@ pub struct PrintDraft {
     pub read_papers_for: Option<String>,
     /// Whether each printer's driver takes two-sided settings, as read in the background for
     /// the printer picked (see [`TwoSidedSource`](super::TwoSidedSource)); `None` when it couldn't be read.
-    pub two_sided: std::collections::BTreeMap<String, Option<bool>>,
+    pub two_sided: BTreeMap<String, Option<bool>>,
     /// The paper, sizing and two-sided choice each printer was last printed with, the printer
     /// printed to last first; kept across restarts (#2001).
     pub setups: Vec<(String, PrinterSetup)>,
 
-    // --- Milestone 4 Production Print Studio Extensions ---
+    // --- Production Print Studio & Unified Broadcast Extensions ---
     /// Enable multi-printer simultaneous batch dispatch.
     pub multi_printer_mode: bool,
     /// The set of chosen printers when in multi-printer mode.
-    pub selected_printers: std::collections::BTreeSet<String>,
+    pub selected_printers: BTreeSet<String>,
     /// Which printer's hardware printable area and margins are being previewed.
     pub active_preview_printer: Option<String>,
     /// Job presets and printer groups store.
@@ -140,16 +210,27 @@ pub struct PrintDraft {
     pub failover_modal: Option<FailoverModalState>,
     /// Pending failover reroute request: (from_printer, to_printer).
     pub pending_failover: Option<(String, String)>,
-    /// Printer whose physical hardware capabilities (margins, DPI, duplex, generation) should be queried off the UI thread.
+    /// Single-slot legacy capability trigger kept for compatibility alongside `pending_caps_queue`.
     pub read_caps_for: Option<String>,
+    /// Non-blocking FIFO queue of printers whose physical hardware capabilities should be queried off the UI thread.
+    pub pending_caps_queue: VecDeque<String>,
     /// Cached hardware capabilities per printer for pre-flight checks, margin preview, and diagnostic export.
-    pub cached_capabilities: std::collections::BTreeMap<String, pdfcraft_platform::diagnostics::PrinterCapabilitiesTelemetry>,
+    pub cached_capabilities: BTreeMap<String, pdfcraft_platform::diagnostics::PrinterCapabilitiesTelemetry>,
     /// Recent execution traces (dispatch, stalls, hardware faults, failovers) for one-click diagnostic export.
     pub diagnostic_traces: Vec<pdfcraft_platform::diagnostics::TraceRecord>,
     /// Optional inline input when saving selected cluster printers as a reusable group.
     pub new_group_name: Option<String>,
     /// Optional inline input when saving current settings as a reusable job preset.
     pub new_preset_name: Option<String>,
+    /// Persisted unified broadcast specifications across restarts for multi-printer workflows.
+    pub broadcast_setup: Option<BroadcastSetup>,
+    /// Whether unified broadcast specifications have been explicitly configured in this session,
+    /// shielding them from being overwritten by single-printer `apply_setup` or async paper reads.
+    pub unified_specs_edited: bool,
+    /// Instant case-insensitive search filter for the Target Printers Dock.
+    pub printer_search_query: String,
+    /// Hide virtual document writers (`Microsoft Print to PDF`, `XPS`, `OneNote`, `Fax`) from the printer dock.
+    pub hide_virtual_printers: bool,
 }
 
 /// State for the One-Click Print Failover modal dialog.
@@ -224,7 +305,7 @@ impl Default for PrintDraft {
             two_sided: Default::default(),
             setups: Vec::new(),
             multi_printer_mode: false,
-            selected_printers: std::collections::BTreeSet::new(),
+            selected_printers: BTreeSet::new(),
             active_preview_printer: None,
             preset_store: crate::workflows::print_presets::PrintPresetStore::with_defaults(),
             preview_hardware_margins: None,
@@ -233,15 +314,404 @@ impl Default for PrintDraft {
             failover_modal: None,
             pending_failover: None,
             read_caps_for: None,
-            cached_capabilities: std::collections::BTreeMap::new(),
+            pending_caps_queue: VecDeque::new(),
+            cached_capabilities: BTreeMap::new(),
             diagnostic_traces: Vec::new(),
             new_group_name: None,
             new_preset_name: None,
+            broadcast_setup: None,
+            unified_specs_edited: false,
+            printer_search_query: String::new(),
+            hide_virtual_printers: false,
         }
     }
 }
 
 impl PrintDraft {
+    /// Whether multi-printer broadcast behavior is currently active.
+    pub fn is_broadcast_active(&self) -> bool {
+        self.multi_printer_mode || self.selected_printers.len() > 1
+    }
+
+    /// Marks unified specs as explicitly edited by the user, clearing any stale preset label
+    /// and updating `broadcast_setup` when broadcasting.
+    pub fn mark_unified_specs_edited(&mut self) {
+        self.unified_specs_edited = true;
+        self.preset_store.active_preset_id = None;
+        if self.is_broadcast_active() {
+            self.broadcast_setup = Some(self.snapshot_broadcast_setup());
+        }
+    }
+
+    /// Current explicit color vs. monochrome choice.
+    pub fn color_intent(&self) -> ColorIntent {
+        if self.grayscale {
+            ColorIntent::Monochrome
+        } else {
+            ColorIntent::Color
+        }
+    }
+
+    /// Sets explicit color or monochrome mode and broadcasts it across all selected printers.
+    pub fn set_color_intent(&mut self, intent: ColorIntent) {
+        self.grayscale = matches!(intent, ColorIntent::Monochrome);
+        self.mark_unified_specs_edited();
+    }
+
+    /// Convenience setter: `true` = Explicit Color (`DMCOLOR_COLOR`), `false` = Explicit B&W (`DMCOLOR_MONOCHROME`).
+    pub fn set_explicit_color(&mut self, explicit_color: bool) {
+        self.set_color_intent(if explicit_color { ColorIntent::Color } else { ColorIntent::Monochrome });
+    }
+
+    /// Current paper dimensions in micrometers `(width_um, height_um)`.
+    pub fn paper_size_um(&self) -> (u32, u32) {
+        let name = self.paper_name();
+        canonical_paper_um(&name, self.paper_size())
+    }
+
+    /// Explicit landscape override (`Some(true)` = Landscape, `Some(false)` = Portrait, `None` = Auto).
+    pub fn landscape_override(&self) -> Option<bool> {
+        match self.orientation {
+            Orientation::Portrait => Some(false),
+            Orientation::Landscape => Some(true),
+            Orientation::Auto => None,
+        }
+    }
+
+    /// Standard paper names offered as 1-click quick pills in the Unified Broadcast Specs pane.
+    pub fn quick_standard_papers() -> &'static [&'static str] {
+        &QUICK_STANDARD_PAPERS
+    }
+
+    /// Instant (`0 ms`) standard paper selection by canonical name (e.g. `"A4"`, `"A3"`, `"US Letter"`, `"Letter"`, `"Legal"`, `"A5"`).
+    /// Sets `paper_overridden = true` so background driver queries never block `Print` or overwrite the choice.
+    pub fn select_standard_paper(&mut self, name: &str) -> bool {
+        let normalized = if name.eq_ignore_ascii_case("letter") {
+            "US Letter"
+        } else if name.eq_ignore_ascii_case("legal") {
+            "US Legal"
+        } else {
+            name
+        };
+        let found = self
+            .papers
+            .iter()
+            .position(|(n, _)| n.eq_ignore_ascii_case(normalized))
+            .or_else(|| {
+                PAPERS
+                    .iter()
+                    .find(|(canon, _)| canon.eq_ignore_ascii_case(normalized))
+                    .and_then(|(canon, sz)| self.find_or_add_paper((*canon).to_string(), *sz))
+            });
+        let Some(pos) = found else { return false };
+        if self.handling == Handling::Label {
+            self.paper_before_label = Some(pos);
+        } else {
+            self.paper = pos;
+        }
+        self.paper_overridden = true;
+        self.sheet = 0;
+        self.mark_unified_specs_edited();
+        true
+    }
+
+    /// Selects a paper entry by index with explicit override protection.
+    pub fn select_paper_index(&mut self, index: usize) {
+        if index < self.paper_count() {
+            if self.handling == Handling::Label {
+                self.paper_before_label = Some(index);
+            } else {
+                self.paper = index;
+            }
+            self.paper_overridden = true;
+            self.sheet = 0;
+            self.mark_unified_specs_edited();
+        }
+    }
+
+    /// Sets unified duplex binding across all selected printers.
+    pub fn set_unified_duplex(&mut self, duplex: Option<spool::Duplex>) {
+        self.duplex = duplex;
+        self.mark_unified_specs_edited();
+    }
+
+    /// Sets unified page orientation across all selected printers.
+    pub fn set_unified_orientation(&mut self, orientation: Orientation) {
+        self.orientation = orientation;
+        self.sheet = 0;
+        self.mark_unified_specs_edited();
+    }
+
+    /// Sets unified page sizing mode across all selected printers.
+    pub fn set_unified_size_mode(&mut self, size: SizeMode) {
+        self.handling = Handling::Size;
+        if let SizeMode::Custom(scale) = size {
+            self.custom_scale = scale.clamp(*CUSTOM_SCALE.start(), *CUSTOM_SCALE.end());
+            self.size = SizeMode::Custom(self.custom_scale);
+        } else {
+            self.size = size;
+        }
+        self.sheet = 0;
+        self.mark_unified_specs_edited();
+    }
+
+    /// Sets unified copy count (`>= 1`) across all selected printers.
+    pub fn set_unified_copies(&mut self, copies: u32) {
+        self.copies = copies.max(1);
+        self.mark_unified_specs_edited();
+    }
+
+    /// Sets unified collation flag across all selected printers.
+    pub fn set_unified_collate(&mut self, collate: bool) {
+        self.collate = collate;
+        self.mark_unified_specs_edited();
+    }
+
+    /// Enqueues a non-blocking background hardware capability query for `printer`.
+    pub fn enqueue_caps_query(&mut self, printer: impl Into<String>) {
+        let name = printer.into();
+        if name.is_empty()
+            || name == crate::web_print::BROWSER_PRINTER
+            || self.cached_capabilities.contains_key(&name)
+            || self.pending_caps_queue.iter().any(|queued| queued == &name)
+        {
+            return;
+        }
+        self.pending_caps_queue.push_back(name);
+    }
+
+    /// Enqueues background capability queries for all selected printers and the preview target.
+    pub fn enqueue_caps_for_selected(&mut self) {
+        let targets: Vec<String> = self
+            .selected_printers
+            .iter()
+            .chain(self.active_preview_printer.iter())
+            .cloned()
+            .collect();
+        for printer in targets {
+            self.enqueue_caps_query(printer);
+        }
+    }
+
+    /// Returns printers filtered by `printer_search_query` and `hide_virtual_printers`.
+    pub fn filtered_printers(&self) -> Vec<&spool::Printer> {
+        let query = self.printer_search_query.trim().to_lowercase();
+        self.printers
+            .iter()
+            .filter(|p| {
+                if self.multi_printer_mode && p.name == crate::web_print::BROWSER_PRINTER {
+                    return false;
+                }
+                if self.hide_virtual_printers && spool::is_virtual_save_printer(&p.name) {
+                    return false;
+                }
+                if query.is_empty() {
+                    return true;
+                }
+                p.name.to_lowercase().contains(&query) || p.description.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    /// Enables or disables multi-printer broadcast mode without clobbering unified specifications.
+    pub fn set_multi_printer_mode(&mut self, enabled: bool) {
+        let was_multi = self.multi_printer_mode;
+        self.multi_printer_mode = enabled;
+        if enabled && !was_multi {
+            if self.selected_printers.is_empty()
+                && let Some(ref primary) = self.printer
+                && primary != crate::web_print::BROWSER_PRINTER
+                && (!self.hide_virtual_printers || !spool::is_virtual_save_printer(primary))
+            {
+                self.selected_printers.insert(primary.clone());
+            }
+            if self.active_preview_printer.is_none() {
+                self.active_preview_printer = self.selected_printers.iter().next().cloned().or_else(|| self.printer.clone());
+            }
+            if let Some(ref bs) = self.broadcast_setup.clone()
+                && !self.unified_specs_edited
+            {
+                self.apply_broadcast_setup(bs);
+            }
+            self.enqueue_caps_for_selected();
+        }
+    }
+
+    /// Selects or deselects a printer card in the Target Printers Dock, synchronizing mode and preview
+    /// without invoking destructive `apply_setup()`.
+    pub fn set_printer_selected(&mut self, printer_name: &str, selected: bool) {
+        if printer_name.is_empty() || printer_name == crate::web_print::BROWSER_PRINTER {
+            return;
+        }
+        if selected {
+            self.selected_printers.insert(printer_name.to_string());
+            self.enqueue_caps_query(printer_name);
+        } else {
+            self.selected_printers.remove(printer_name);
+        }
+        self.preset_store.active_group_id = None;
+
+        if self.selected_printers.len() > 1 {
+            self.multi_printer_mode = true;
+            self.unified_specs_edited = true;
+            self.broadcast_setup = Some(self.snapshot_broadcast_setup());
+        } else if !self.multi_printer_mode && self.selected_printers.len() == 1 {
+            self.printer = self.selected_printers.iter().next().cloned();
+            self.printer_picked = true;
+        }
+
+        if self
+            .active_preview_printer
+            .as_ref()
+            .is_none_or(|cur| !self.selected_printers.contains(cur))
+        {
+            self.active_preview_printer = self.selected_printers.iter().next().cloned();
+            if let Some(preview) = self.active_preview_printer.clone() {
+                self.set_preview_printer(preview);
+            }
+        }
+    }
+
+    /// Toggles selection of `printer_name` and returns its new selection state.
+    pub fn toggle_printer_selection(&mut self, printer_name: &str) -> bool {
+        let next = !self.selected_printers.contains(printer_name);
+        self.set_printer_selected(printer_name, next);
+        next
+    }
+
+    /// Selects all printers currently visible under `filtered_printers()`.
+    pub fn select_all_filtered_printers(&mut self) {
+        let names: Vec<String> = self
+            .filtered_printers()
+            .into_iter()
+            .filter(|p| p.name != crate::web_print::BROWSER_PRINTER)
+            .map(|p| p.name.clone())
+            .collect();
+        for name in names {
+            self.selected_printers.insert(name);
+        }
+        self.preset_store.active_group_id = None;
+        if self.selected_printers.len() > 1 {
+            self.multi_printer_mode = true;
+            self.unified_specs_edited = true;
+        } else if self.selected_printers.len() == 1 && !self.multi_printer_mode {
+            self.printer = self.selected_printers.iter().next().cloned();
+            self.printer_picked = true;
+        }
+        if self.active_preview_printer.is_none() {
+            self.active_preview_printer = self.selected_printers.iter().next().cloned();
+        }
+        self.enqueue_caps_for_selected();
+    }
+
+    /// Clears all selected cluster printers.
+    pub fn clear_selected_printers(&mut self) {
+        self.selected_printers.clear();
+        self.preset_store.active_group_id = None;
+    }
+
+    /// Clears all printer cards in the Target Printers Dock so zero queues are checked.
+    pub fn clear_printer_cards(&mut self) {
+        self.multi_printer_mode = true;
+        self.selected_printers.clear();
+        self.preset_store.active_group_id = None;
+    }
+
+    /// Whether `printer_name`'s card is currently selected as an active print target.
+    pub fn is_printer_card_selected(&self, printer_name: &str) -> bool {
+        if self.multi_printer_mode || !self.selected_printers.is_empty() {
+            self.selected_printers.contains(printer_name)
+        } else {
+            self.printer.as_deref() == Some(printer_name)
+        }
+    }
+
+    /// Number of active physical/queue targets that will receive unified specifications.
+    pub fn effective_target_count(&self) -> usize {
+        if self.multi_printer_mode {
+            self.dispatchable_target_printers().len()
+        } else {
+            usize::from(self.printer.is_some())
+        }
+    }
+
+    /// Toggles a full-row printer card cleanly: seeds the active single printer when transitioning
+    /// into multi-printer selection and preserves all unified broadcast specifications.
+    pub fn click_printer_card(&mut self, printer_name: &str) -> bool {
+        if printer_name.is_empty() || printer_name == crate::web_print::BROWSER_PRINTER {
+            return false;
+        }
+        if !self.multi_printer_mode
+            && self.selected_printers.is_empty()
+            && let Some(ref cur) = self.printer
+            && cur != crate::web_print::BROWSER_PRINTER
+            && (!self.hide_virtual_printers || !spool::is_virtual_save_printer(cur))
+        {
+            self.selected_printers.insert(cur.clone());
+        }
+        let now_selected = if self.selected_printers.contains(printer_name) {
+            self.selected_printers.remove(printer_name);
+            false
+        } else {
+            self.selected_printers.insert(printer_name.to_string());
+            self.enqueue_caps_query(printer_name);
+            true
+        };
+        self.preset_store.active_group_id = None;
+
+        match self.selected_printers.len() {
+            0 => {
+                self.multi_printer_mode = true;
+            }
+            1 => {
+                let only = self.selected_printers.iter().next().cloned();
+                self.printer = only.clone();
+                self.printer_picked = true;
+                if self.multi_printer_mode {
+                    self.broadcast_setup = Some(self.snapshot_broadcast_setup());
+                }
+                if let Some(p) = only {
+                    self.read_papers_for = Some(p);
+                }
+            }
+            _ => {
+                self.multi_printer_mode = true;
+                self.unified_specs_edited = true;
+                self.broadcast_setup = Some(self.snapshot_broadcast_setup());
+            }
+        }
+
+        if self
+            .active_preview_printer
+            .as_ref()
+            .is_none_or(|cur| !self.selected_printers.contains(cur))
+            && let Some(preview) = self.selected_printers.iter().next().cloned()
+        {
+            self.set_preview_printer(preview);
+        }
+        now_selected
+    }
+
+    /// Switches immediately to "Save as PDF" mode.
+    pub fn select_save_as_pdf(&mut self) {
+        self.multi_printer_mode = false;
+        self.selected_printers.clear();
+        self.preset_store.active_group_id = None;
+        self.printer = None;
+        self.printer_picked = true;
+    }
+
+    /// Sets which printer's physical margins are rendered in the live sheet preview.
+    pub fn set_preview_printer(&mut self, printer_name: impl Into<String>) {
+        let name = printer_name.into();
+        self.active_preview_printer = Some(name.clone());
+        if let Some(caps) = self.cached_capabilities.get(&name).cloned() {
+            self.apply_capabilities_telemetry(name, caps);
+        } else {
+            self.enqueue_caps_query(name);
+        }
+    }
+
     /// Appends a diagnostic trace record, capping the buffer at 250 entries.
     pub fn push_trace(&mut self, record: pdfcraft_platform::diagnostics::TraceRecord) {
         if self.diagnostic_traces.len() >= 250 {
@@ -285,7 +755,7 @@ impl PrintDraft {
         self.cached_capabilities.insert(printer_name, caps);
     }
 
-    /// Creates a `PrintJobPreset` snapshot from the current dialog choices.
+    /// Creates a `PrintJobPreset` snapshot from the current dialog choices (including paper label & dimensions).
     pub fn snapshot_as_preset(&self, id: String, name: String) -> crate::workflows::print_presets::PrintJobPreset {
         let color_mode = if self.grayscale {
             crate::workflows::print_presets::PresetColorMode::Monochrome
@@ -293,9 +763,10 @@ impl PrintDraft {
             crate::workflows::print_presets::PresetColorMode::Color
         };
         let duplex = match self.duplex {
+            Some(spool::Duplex::Off) => crate::workflows::print_presets::PresetDuplex::Simplex,
             Some(spool::Duplex::LongEdge) => crate::workflows::print_presets::PresetDuplex::LongEdge,
             Some(spool::Duplex::ShortEdge) => crate::workflows::print_presets::PresetDuplex::ShortEdge,
-            _ => crate::workflows::print_presets::PresetDuplex::Simplex,
+            None => crate::workflows::print_presets::PresetDuplex::PrinterDefault,
         };
         let orientation = match self.orientation {
             Orientation::Portrait => crate::workflows::print_presets::PresetOrientation::Portrait,
@@ -308,6 +779,17 @@ impl PrintDraft {
             SizeMode::Shrink => crate::workflows::print_presets::PresetFitMode::ShrinkOversized,
             SizeMode::Custom(_) => crate::workflows::print_presets::PresetFitMode::CustomScale(self.custom_scale as f32),
         };
+        let paper_idx = if self.handling == Handling::Label {
+            self.paper_before_label.unwrap_or(self.paper)
+        } else {
+            self.paper
+        };
+        let paper_name = self.paper_name_at(paper_idx).to_string();
+        let paper_pt = self
+            .papers
+            .get(paper_idx)
+            .map(|(_, sz)| *sz)
+            .unwrap_or_else(|| self.paper_size());
         crate::workflows::print_presets::PrintJobPreset {
             id,
             name,
@@ -320,24 +802,64 @@ impl PrintDraft {
             fit_mode,
             custom_scale_pct: matches!(self.size, SizeMode::Custom(_)).then_some(self.custom_scale as f32),
             collate: self.collate,
+            paper_label: Some(paper_name.clone()),
+            paper_size_um: Some(canonical_paper_um(&paper_name, paper_pt)),
         }
     }
-    /// Applies a saved job preset to the current draft configuration.
+
+    /// Saves the current unified draft choices (including paper label & micrometer dimensions)
+    /// into `self.preset_store` and activates the saved preset.
+    pub fn save_current_as_preset(
+        &mut self,
+        id: String,
+        name: String,
+    ) -> crate::workflows::print_presets::PrintJobPreset {
+        let preset = self.snapshot_as_preset(id.clone(), name);
+        self.preset_store.upsert_preset(preset.clone());
+        self.preset_store.set_active_preset(Some(id));
+        preset
+    }
+
+    /// Applies a saved job preset to the current draft configuration (including optional paper size).
     pub fn apply_preset(&mut self, preset: &crate::workflows::print_presets::PrintJobPreset) {
-        self.copies = preset.copies;
+        self.copies = preset.copies.max(1);
         self.collate = preset.collate;
         self.grayscale = matches!(preset.color_mode, crate::workflows::print_presets::PresetColorMode::Monochrome);
         self.duplex = match preset.duplex {
             crate::workflows::print_presets::PresetDuplex::Simplex => Some(spool::Duplex::Off),
             crate::workflows::print_presets::PresetDuplex::LongEdge => Some(spool::Duplex::LongEdge),
             crate::workflows::print_presets::PresetDuplex::ShortEdge => Some(spool::Duplex::ShortEdge),
+            crate::workflows::print_presets::PresetDuplex::PrinterDefault => None,
         };
         self.orientation = match preset.orientation {
             crate::workflows::print_presets::PresetOrientation::Auto => Orientation::Auto,
             crate::workflows::print_presets::PresetOrientation::Portrait => Orientation::Portrait,
             crate::workflows::print_presets::PresetOrientation::Landscape => Orientation::Landscape,
         };
-        match &preset.fit_mode {
+        self.apply_preset_fit_mode(&preset.fit_mode, preset.custom_scale_pct);
+        self.apply_preset_paper(preset.paper_label.as_deref(), preset.paper_size_um);
+        self.unified_specs_edited = true;
+        self.preset_store.active_preset_id = Some(preset.id.clone());
+        if self.is_broadcast_active() {
+            self.broadcast_setup = Some(self.snapshot_broadcast_setup());
+        }
+    }
+
+    /// Applies a preset from `self.preset_store` by ID. Returns `true` if found and applied.
+    pub fn apply_preset_by_id(&mut self, id: &str) -> bool {
+        let Some(preset) = self.preset_store.get_preset(id).cloned() else {
+            return false;
+        };
+        self.apply_preset(&preset);
+        true
+    }
+
+    fn apply_preset_fit_mode(
+        &mut self,
+        fit_mode: &crate::workflows::print_presets::PresetFitMode,
+        custom_scale_pct: Option<f32>,
+    ) {
+        match fit_mode {
             crate::workflows::print_presets::PresetFitMode::FitToPrintable => {
                 self.handling = Handling::Size;
                 self.size = SizeMode::Fit;
@@ -353,26 +875,86 @@ impl PrintDraft {
             }
             crate::workflows::print_presets::PresetFitMode::CustomScale(s) => {
                 self.handling = Handling::Size;
-                self.size = SizeMode::Custom(*s as f64);
-                self.custom_scale = *s as f64;
+                let clamped = f64::from(*s).clamp(*CUSTOM_SCALE.start(), *CUSTOM_SCALE.end());
+                self.size = SizeMode::Custom(clamped);
+                self.custom_scale = clamped;
             }
         }
-        if let Some(s) = preset.custom_scale_pct {
-            self.custom_scale = s as f64;
+        if let Some(s) = custom_scale_pct {
+            let clamped = f64::from(s).clamp(*CUSTOM_SCALE.start(), *CUSTOM_SCALE.end());
+            self.custom_scale = clamped;
             if matches!(self.size, SizeMode::Custom(_)) {
-                self.size = SizeMode::Custom(s as f64);
+                self.size = SizeMode::Custom(clamped);
             }
         }
     }
 
-    /// Selects all printers associated with a named printer group.
-    pub fn select_printer_group(&mut self, group_id: &str) {
-        if let Some(group) = self.preset_store.get_group(group_id) {
-            self.selected_printers = group.printer_names.clone();
-            if self.active_preview_printer.is_none() {
-                self.active_preview_printer = self.selected_printers.iter().next().cloned();
+    fn apply_preset_paper(&mut self, label: Option<&str>, size_um: Option<(u32, u32)>) {
+        if let Some(lbl) = label
+            && let Some(idx) = self.paper_index(lbl)
+        {
+            self.paper = idx;
+            self.paper_overridden = true;
+            return;
+        }
+        if let Some((w_um, h_um)) = size_um {
+            let size_pt = (um_to_points(w_um), um_to_points(h_um));
+            let name = label.unwrap_or_default().to_string();
+            if let Some(pos) = self.find_or_add_paper(name, size_pt) {
+                self.paper = pos;
+                self.paper_overridden = true;
             }
         }
+    }
+
+    /// Selects all available physical printers associated with a named printer group,
+    /// updating `active_group_id` and filtering out disconnected or browser-only queues.
+    pub fn select_printer_group(&mut self, group_id: &str) {
+        let Some(raw_names) = self.preset_store.get_group(group_id).map(|g| g.printer_names.clone()) else {
+            return;
+        };
+        let filtered: BTreeSet<String> = raw_names
+            .into_iter()
+            .filter(|name| {
+                if name == crate::web_print::BROWSER_PRINTER {
+                    return false;
+                }
+                if self.hide_virtual_printers && spool::is_virtual_save_printer(name) {
+                    return false;
+                }
+                self.printers.is_empty() || self.printers.iter().any(|p| p.name == *name)
+            })
+            .collect();
+        self.preset_store.set_active_group(Some(group_id.to_string()));
+        self.selected_printers = filtered;
+        if !self.selected_printers.is_empty() {
+            self.multi_printer_mode = true;
+            self.unified_specs_edited = true;
+        }
+        if self
+            .active_preview_printer
+            .as_ref()
+            .is_none_or(|cur| !self.selected_printers.contains(cur))
+        {
+            self.active_preview_printer = self.selected_printers.iter().next().cloned();
+        }
+        self.enqueue_caps_for_selected();
+    }
+
+    /// Returns printers listed in `group_id` that are not currently installed/online in `self.printers`.
+    pub fn missing_group_printers(&self, group_id: &str) -> Vec<String> {
+        let Some(group) = self.preset_store.get_group(group_id) else {
+            return Vec::new();
+        };
+        if self.printers.is_empty() {
+            return Vec::new();
+        }
+        group
+            .printer_names
+            .iter()
+            .filter(|name| !self.printers.iter().any(|p| p.name == **name))
+            .cloned()
+            .collect()
     }
 
     /// Evaluates if content bounds extend outside the printable area.
@@ -430,9 +1012,11 @@ impl PrintDraft {
 
     /// Whether automatic paper detection for the selected printer is in progress and unresolved.
     ///
-    /// When true, the user has not explicitly chosen or overridden the paper, and the selected
-    /// printer's media sizes and default paper are still being read in the background off the GUI thread.
+    /// Never blocks submission when multi-printer broadcast mode is active.
     pub fn papers_loading(&self) -> bool {
+        if self.is_broadcast_active() {
+            return false;
+        }
         let Some(p) = self.printer.as_deref() else { return false };
         !self.paper_overridden && (self.papers_loading.as_deref() == Some(p) || self.read_papers_for.as_deref() == Some(p))
     }
@@ -633,11 +1217,96 @@ impl PrintDraft {
         setups::record(&mut self.setups, &printer, setup);
     }
 
+    /// Captures the current unified broadcast specifications for session/restart persistence.
+    pub fn snapshot_broadcast_setup(&self) -> BroadcastSetup {
+        let paper_idx = if self.handling == Handling::Label {
+            self.paper_before_label.unwrap_or(self.paper)
+        } else {
+            self.paper
+        };
+        let paper_name = self.paper_name_at(paper_idx).to_string();
+        let paper_size_pt = self
+            .papers
+            .get(paper_idx)
+            .map(|(_, sz)| *sz)
+            .unwrap_or_else(|| self.paper_size());
+        let keep_specs_across_docs = self
+            .broadcast_setup
+            .as_ref()
+            .is_some_and(|prev| prev.keep_specs_across_docs);
+        BroadcastSetup {
+            paper: paper_name,
+            paper_size_pt,
+            explicit_color: !self.grayscale,
+            duplex: self.duplex,
+            orientation: self.orientation,
+            size: self.size,
+            custom_scale: self.custom_scale,
+            copies: self.copies.max(1),
+            collate: self.collate,
+            keep_specs_across_docs,
+        }
+    }
+
+    /// Restores unified broadcast specifications onto this draft without per-printer clobbering.
+    pub fn apply_broadcast_setup(&mut self, setup: &BroadcastSetup) {
+        self.grayscale = !setup.explicit_color;
+        self.duplex = setup.duplex;
+        self.orientation = setup.orientation;
+        self.custom_scale = setup.custom_scale;
+        self.size = match setup.size {
+            SizeMode::Custom(_) => SizeMode::Custom(setup.custom_scale),
+            other => other,
+        };
+        self.copies = setup.copies.max(1);
+        self.collate = setup.collate;
+        let matched = self
+            .paper_index(&setup.paper)
+            .or_else(|| self.find_or_add_paper(setup.paper.clone(), setup.paper_size_pt));
+        if let Some(paper) = matched {
+            if self.handling == Handling::Label {
+                self.paper_before_label = Some(paper);
+            } else {
+                self.paper = paper;
+            }
+            self.paper_overridden = true;
+        }
+        self.sheet = 0;
+    }
+
+    /// Records the unified setup for every selected printer in a multi-printer cluster dispatch
+    /// AND updates `self.broadcast_setup` so restarts restore the full unified configuration.
+    pub fn remember_cluster_setup(&mut self) {
+        let paper_idx = if self.handling == Handling::Label {
+            self.paper_before_label.unwrap_or(self.paper)
+        } else {
+            self.paper
+        };
+        let per_printer = PrinterSetup {
+            paper: self.paper_name_at(paper_idx).to_string(),
+            size: self.size,
+            custom_scale: self.custom_scale,
+            duplex: self.duplex,
+        };
+        let targets = self.dispatchable_target_printers();
+        setups::record_many(&mut self.setups, targets.iter().map(String::as_str), &per_printer);
+        self.broadcast_setup = Some(self.snapshot_broadcast_setup());
+    }
+
     /// Bring back what the chosen printer was last printed with, when it has been printed to
-    /// (#2001); a printer never printed to keeps the dialog's choices. While Label holds the
-    /// label stock, the printer's paper is what leaving Label gives back. A custom paper taken
-    /// off the list since leaves the paper as it is.
+    /// (#2001); a printer never printed to keeps the dialog's choices.
+    ///
+    /// In multi-printer broadcast mode, single-printer history never overwrites the unified
+    /// broadcast specifications.
     pub fn apply_setup(&mut self) {
+        if self.is_broadcast_active() {
+            if !self.unified_specs_edited
+                && let Some(bs) = self.broadcast_setup.clone()
+            {
+                self.apply_broadcast_setup(&bs);
+            }
+            return;
+        }
         let Some(printer) = self.printer.as_deref() else { return };
         let Some(setup) = self.setups.iter().find(|(name, _)| name == printer).map(|(_, s)| s.clone()) else { return };
         self.size = setup.size;
@@ -654,6 +1323,75 @@ impl PrintDraft {
             self.paper_overridden = true;
         }
         self.sheet = 0;
+    }
+
+    /// Applies a `CapturedDriverTemplate` (from a reference printer's native `DocumentPropertiesW` dialog)
+    /// directly onto the unified broadcast draft so all selected printers inherit the exact specs.
+    pub fn apply_captured_driver_template(&mut self, tpl: spool::CapturedDriverTemplate) {
+        if let Some((w_um, h_um)) = tpl.paper_um
+            && w_um > 0
+            && h_um > 0
+        {
+            let raw_w = um_to_points(w_um);
+            let raw_h = um_to_points(h_um);
+            let portrait_pt = (raw_w.min(raw_h), raw_w.max(raw_h));
+            let label = tpl.paper_name.unwrap_or_default();
+            if let Some(pos) = self.find_or_add_paper(label, portrait_pt) {
+                if self.handling == Handling::Label {
+                    self.paper_before_label = Some(pos);
+                } else {
+                    self.paper = pos;
+                }
+                self.paper_overridden = true;
+            }
+        } else if let Some(ref label) = tpl.paper_name
+            && let Some(pos) = self.paper_index(label)
+        {
+            self.paper = pos;
+            self.paper_overridden = true;
+        }
+
+        if let Some(gray) = tpl.grayscale {
+            self.grayscale = gray;
+        }
+        if let Some(duplex) = tpl.duplex {
+            self.duplex = Some(duplex);
+        }
+        if let Some(is_landscape) = tpl.landscape {
+            self.orientation = if is_landscape {
+                Orientation::Landscape
+            } else {
+                Orientation::Portrait
+            };
+        }
+        if let Some(copies) = tpl.copies {
+            self.copies = copies.max(1);
+        }
+        if let Some(collate) = tpl.collate {
+            self.collate = collate;
+        }
+        self.driver_error = None;
+        self.sheet = 0;
+        self.mark_unified_specs_edited();
+    }
+
+    /// Opens the native driver template dialog for `printer`, captures all normalized fields,
+    /// and applies them onto this unified draft. Returns `Ok(true)` if applied, `Ok(false)` if cancelled.
+    pub fn capture_driver_template_from(&mut self, printer: &str) -> Result<bool, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        pdfcraft_platform::install_print_bridge();
+        match spool::capture_driver_template(printer) {
+            Ok(Some(tpl)) => {
+                self.apply_captured_driver_template(tpl);
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(err) => {
+                let msg = err.to_string();
+                self.driver_error = Some(msg.clone());
+                Err(msg)
+            }
+        }
     }
 
     /// The printer printed to last, while `printers` still lists it (#2001).
@@ -798,11 +1536,158 @@ impl PrintDraft {
         }
     }
 
+    /// Returns sanitized, currently installed physical/OS target printers ready for batch dispatch,
+    /// stripping `BROWSER_PRINTER` and any uninstalled ghost queues left over from previous sessions.
+    pub fn dispatchable_target_printers(&self) -> Vec<String> {
+        let candidates = if self.multi_printer_mode {
+            self.selected_printers.iter().cloned().collect::<Vec<_>>()
+        } else {
+            self.printer.iter().cloned().collect::<Vec<_>>()
+        };
+        candidates
+            .into_iter()
+            .filter(|name| {
+                if name.is_empty() || name == crate::web_print::BROWSER_PRINTER {
+                    return false;
+                }
+                if self.hide_virtual_printers && spool::is_virtual_save_printer(name) {
+                    return false;
+                }
+                self.printers.is_empty() || self.printers.iter().any(|p| p.name == *name)
+            })
+            .collect()
+    }
+
+    /// Returns eligible automatic failover target printers for `faulted_printer`, excluding
+    /// `faulted_printer`, `BROWSER_PRINTER`, virtual file-save queues (`spool::is_virtual_save_printer`),
+    /// and printers already busy in `active_in_batch`.
+    pub fn eligible_failover_printers(
+        &self,
+        faulted_printer: &str,
+        active_in_batch: &BTreeSet<String>,
+    ) -> Vec<String> {
+        let mut idle_physical = Vec::new();
+        let mut fallback_physical = Vec::new();
+        for p in &self.printers {
+            if p.name == faulted_printer
+                || p.name == crate::web_print::BROWSER_PRINTER
+                || spool::is_virtual_save_printer(&p.name)
+            {
+                continue;
+            }
+            if !active_in_batch.contains(&p.name) {
+                idle_physical.push(p.name.clone());
+            } else {
+                fallback_physical.push(p.name.clone());
+            }
+        }
+        if !idle_physical.is_empty() {
+            idle_physical
+        } else {
+            fallback_physical
+        }
+    }
+
+    /// Returns eligible failover printers for interactive modal selection (excluding `faulted_printer`
+    /// and virtual save-to-file printers).
+    pub fn failover_candidates(&self, faulted_printer: &str) -> Vec<String> {
+        self.eligible_failover_printers(faulted_printer, &self.selected_printers)
+    }
+
+    /// Returns selected printers that are known simplex-only (`two_sided == Some(false)`) while a
+    /// two-sided mode (`LongEdge` or `ShortEdge`) is requested.
+    pub fn duplex_simplex_fallback_printers(&self) -> Vec<String> {
+        let wants_two_sided = if self.handling == Handling::Booklet {
+            self.booklet_subset == BookletSubset::BothSides
+        } else {
+            matches!(self.duplex, Some(spool::Duplex::LongEdge | spool::Duplex::ShortEdge))
+        };
+        if !wants_two_sided {
+            return Vec::new();
+        }
+        self.target_printers()
+            .into_iter()
+            .filter(|name| self.printer_two_sided_for(name) == Some(false))
+            .collect()
+    }
+
+    /// Builds a structured pre-flight broadcast summary for `printer_name` (used by `preview_pane.rs`).
+    pub fn broadcast_summary_for(&self, printer_name: &str) -> PrinterBroadcastSummary {
+        let listed = self.printers.iter().find(|p| p.name == printer_name);
+        let is_installed = self.printers.is_empty() || listed.is_some();
+        let is_default = listed.is_some_and(|p| p.default);
+        let two_sided = self.printer_two_sided_for(printer_name);
+        let requested_duplex = if self.cut_and_stack() {
+            Some(spool::Duplex::Off)
+        } else if self.handling == Handling::Booklet {
+            match self.booklet_subset {
+                BookletSubset::BothSides => Some(spool::Duplex::ShortEdge),
+                BookletSubset::FrontOnly | BookletSubset::BackOnly => Some(spool::Duplex::Off),
+            }
+        } else {
+            self.duplex
+        };
+        let effective_duplex = if self.cut_and_stack() {
+            Some(spool::Duplex::Off)
+        } else if self.handling == Handling::Booklet {
+            print::booklet_job_duplex(self.booklet_subset, two_sided)
+        } else {
+            self.chosen_duplex_for(Some(printer_name))
+        };
+        let duplex_fallback_to_simplex = matches!(
+            requested_duplex,
+            Some(spool::Duplex::LongEdge | spool::Duplex::ShortEdge)
+        ) && two_sided == Some(false);
+
+        PrinterBroadcastSummary {
+            printer_name: printer_name.to_string(),
+            is_installed,
+            is_virtual_save_printer: spool::is_virtual_save_printer(printer_name),
+            is_default,
+            paper_name: self.paper_name().to_string(),
+            paper_size_pt: self.paper_size(),
+            paper_size_um: self.paper_size_um(),
+            color_intent: self.color_intent(),
+            requested_duplex,
+            effective_duplex,
+            duplex_fallback_to_simplex,
+            orientation: self.orientation,
+            size_mode: self.size,
+            copies: self.copies.max(1),
+            collate: self.collate,
+        }
+    }
+
+    /// Returns broadcast summaries for all active target printers.
+    pub fn broadcast_summaries(&self) -> Vec<PrinterBroadcastSummary> {
+        self.target_printers()
+            .iter()
+            .map(|name| self.broadcast_summary_for(name))
+            .collect()
+    }
+
+    /// Stamps explicit unified broadcast metadata (`OPT_COLOR_INTENT`, `OPT_PAPER_UM`, `OPT_ORIENTATION`)
+    /// onto `job` via `spool::set_job_broadcast_specs` for deterministic Win32 `DEVMODEW + PrintTicket` enforcement.
+    pub fn apply_broadcast_specs_to_job(&self, job: &mut spool::Job) {
+        spool::set_job_broadcast_specs(
+            job,
+            !self.grayscale,
+            self.paper_size_um(),
+            self.landscape_override(),
+        );
+    }
+
     /// Builds the unified spooler job tailored to `target_printer` (applying unified copies, collate,
-    /// grayscale, paper media keyword, and per-printer duplex capability safety).
+    /// explicit color/monochrome intent, paper media & micrometer dimensions, and per-printer duplex safety,
+    /// without leaking vendor-specific driver options or proprietary paper names across printers).
     pub fn job_for_printer(&self, target_printer: Option<&str>, title: &str) -> spool::Job {
         let two_sided = target_printer.and_then(|name| self.printer_two_sided_for(name));
-        spool::Job {
+        let paper_name = self.paper_name();
+        let shareable_media_name = (!self.paper_is_custom()
+            && (!self.multi_printer_mode || PAPERS.iter().any(|(canon, _)| *canon == paper_name)))
+        .then(|| paper_name.to_string());
+
+        let mut job = spool::Job {
             printer: target_printer.map(str::to_owned),
             copies: self.copies.max(1),
             collate: self.collate,
@@ -821,7 +1706,7 @@ impl PrintDraft {
             // Set when the copy sent is made grey (`spooler_copy`, #5806).
             grey_pages: false,
             title: title.to_string(),
-            // Only for the printer the options were read from.
+            // Only for the printer the options were read from (never leaked across printers).
             options: match (target_printer, &self.driver_options) {
                 (Some(p), Some((read_for, _))) if p == read_for => {
                     self.driver_choices.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
@@ -830,13 +1715,19 @@ impl PrintDraft {
             }
             .into_iter()
             // The sheet the PDF was laid out on, not the queue's default paper.
-            // A user's custom label is not a keyword from the driver's media catalog.
+            // Custom or vendor-specific paper names from another printer fall back to exact dimensions.
             .chain(Some(print::paper_media_option(
-                (!self.paper_is_custom()).then(|| self.paper_name()).as_deref(),
+                shareable_media_name.as_deref(),
                 self.paper_size(),
             )))
             .collect(),
+        };
+
+        if self.multi_printer_mode {
+            self.apply_broadcast_specs_to_job(&mut job);
         }
+
+        job
     }
 
     /// The spooler job for this print: the dialog's copies, two-sided and colour settings, the

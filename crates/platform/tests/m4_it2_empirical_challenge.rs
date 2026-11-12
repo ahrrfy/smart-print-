@@ -331,14 +331,14 @@ fn challenge_preset_store_built_in_protection_and_crud() {
     assert!(store.presets.contains_key("standard-duplex"));
     assert!(store.presets.contains_key("monochrome-eco"));
     assert!(store.presets.contains_key("engineering-100"));
-    assert_eq!(store.active_preset_id.as_deref(), Some("standard-duplex"));
+    assert_eq!(store.active_preset_id, None);
 
     // INVARIANT 1: Built-in presets CANNOT be deleted
     assert!(!store.delete_preset("standard-duplex"), "Deleting standard-duplex must fail");
     assert!(!store.delete_preset("monochrome-eco"), "Deleting monochrome-eco must fail");
     assert!(!store.delete_preset("engineering-100"), "Deleting engineering-100 must fail");
     assert_eq!(store.presets.len(), 3, "Presets count must remain 3");
-    assert_eq!(store.active_preset_id.as_deref(), Some("standard-duplex"));
+    assert_eq!(store.active_preset_id, None);
 
     // INVARIANT 2: User custom preset CRUD lifecycle
     let custom_preset = PrintJobPreset {
@@ -353,6 +353,8 @@ fn challenge_preset_store_built_in_protection_and_crud() {
         fit_mode: PresetFitMode::FitToPrintable,
         custom_scale_pct: None,
         collate: true,
+        paper_label: None,
+        paper_size_um: None,
     };
 
     store.upsert_preset(custom_preset);

@@ -2071,3 +2071,291 @@ fn each_printer_keeps_what_it_last_printed_with_across_a_restart() {
     open(&mut gone);
     assert_eq!(setup(&gone), office);
 }
+
+#[test]
+fn print_studio_expands_to_spacious_three_pane_desktop_width_and_adapts_to_narrow_screens() {
+    use pdfcraft_engine::print::spool::Printer;
+    use std::sync::Arc;
+
+    let mut h = harness();
+    h.state_mut().printer_source = Some(Arc::new(|| {
+        vec![Printer { name: "Studio Laser".into(), default: true, two_sided: Some(true), description: String::new() }]
+    }));
+    h.state_mut().printer_papers_source = Some(Arc::new(|_| Vec::new()));
+    h.state_mut().default_paper_source = Some(Arc::new(|_| None));
+    assert!(h.state_mut().execute("print.dialog"));
+    settle(&mut h);
+
+    let card: egui::Rect = h
+        .ctx
+        .data(|d| d.get_temp(egui::Id::unique("dialog").with("card")))
+        .expect("print studio modal card");
+    assert!(
+        card.width() >= 1180.0 && card.width() <= 1360.0,
+        "desktop Print Studio uses spacious 1160 pt inner width instead of cramped 820 pt: {card:?}"
+    );
+
+    let left_hdr = h.get_by_label("Target Printers").rect();
+    let center_ctrl = h.get_by_role_and_label(Role::RadioButton, "Explicit Color").rect();
+    let right_sheet = h.get_by_label("Sheet 1 of 1").rect();
+    assert!(left_hdr.right() < center_ctrl.left(), "left printers dock sits left of center specs: {left_hdr:?} vs {center_ctrl:?}");
+    assert!(center_ctrl.right() < right_sheet.left(), "center specs sit left of right live preview: {center_ctrl:?} vs {right_sheet:?}");
+    assert!(card.contains_rect(right_sheet), "right preview fits inside card: {right_sheet:?} in {card:?}");
+
+    // Narrow/short viewport (< 1020 pt) adapts smoothly to 2-column compact mode without overflowing.
+    let mut compact = Harness::builder().with_size(egui::vec2(960.0, 520.0)).build_eframe(|_cc| {
+        let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.open_bytes("form.pdf", None, include_bytes!("../data/form.pdf").to_vec()).unwrap();
+        app
+    });
+    compact.run_steps(4);
+    compact.state_mut().printer_source = Some(Arc::new(Vec::new));
+    assert!(compact.state_mut().execute("print.dialog"));
+    settle(&mut compact);
+
+    let compact_card: egui::Rect = compact
+        .ctx
+        .data(|d| d.get_temp(egui::Id::unique("dialog").with("card")))
+        .expect("compact print modal card");
+    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 520.0));
+    assert!(compact_card.width() <= 940.0, "compact width stays inside 960 px screen: {compact_card:?}");
+    let cancel_rect = compact.get_by_role_and_label(Role::Button, "Cancel").rect();
+    assert!(viewport.contains_rect(cancel_rect), "footer buttons stay inside short 520 px screen: {cancel_rect:?}");
+}
+
+#[test]
+fn full_row_printer_cards_search_filter_virtual_toggle_and_groups_select_smoothly() {
+    use pdfcraft_engine::print::spool::Printer;
+    use std::sync::Arc;
+
+    let mut h = harness();
+    h.state_mut().printer_source = Some(Arc::new(|| {
+        let mut list: Vec<Printer> = (1..=14)
+            .map(|i| Printer {
+                name: format!("Floor {i} Laser"),
+                default: i == 1,
+                two_sided: Some(i % 2 == 1),
+                description: format!("Building Wing {i}"),
+            })
+            .collect();
+        list.push(Printer {
+            name: "Microsoft Print to PDF".into(),
+            default: false,
+            two_sided: Some(false),
+            description: "Virtual PDF writer".into(),
+        });
+        list.push(Printer {
+            name: "Microsoft XPS Document Writer".into(),
+            default: false,
+            two_sided: Some(false),
+            description: "Virtual XPS writer".into(),
+        });
+        list
+    }));
+    h.state_mut().printer_papers_source = Some(Arc::new(|_| Vec::new()));
+    h.state_mut().default_paper_source = Some(Arc::new(|_| None));
+
+    assert!(h.state_mut().execute("print.dialog"));
+    settle(&mut h);
+
+    // Virtual queues start visible and toggling "Hide virtual" filters them out cleanly.
+    assert!(!h.state().print_draft.hide_virtual_printers);
+    h.get_by_role_and_label(Role::CheckBox, "Target printer: Microsoft Print to PDF").scroll_to_me();
+    h.run_steps(4);
+    assert!(h.query_by_role_and_label(Role::CheckBox, "Target printer: Microsoft Print to PDF").is_some());
+    h.get_by_role_and_label(Role::CheckBox, "Hide virtual").click();
+    h.run_steps(2);
+    assert!(h.state().print_draft.hide_virtual_printers);
+    assert!(h.query_by_role_and_label(Role::CheckBox, "Target printer: Microsoft Print to PDF").is_none());
+    h.get_by_role_and_label(Role::CheckBox, "Target printer: Floor 2 Laser").scroll_to_me();
+    h.run_steps(4);
+
+    // Clicking a second full-row printer card smoothly promotes the default printer + clicked card into broadcast mode.
+    h.get_by_role_and_label(Role::CheckBox, "Target printer: Floor 2 Laser").click();
+    h.run_steps(2);
+    assert!(h.state().print_draft.multi_printer_mode);
+    assert!(h.state().print_draft.selected_printers.contains("Floor 1 Laser"));
+    assert!(h.state().print_draft.selected_printers.contains("Floor 2 Laser"));
+    h.get_by_label("Selected (2)");
+    h.get_by_label_contains("Unified Broadcast Active — all specs below apply to 2 selected printers");
+
+    // Smooth isolated ScrollArea: scrolling to the 14th printer card and clicking it selects it cleanly.
+    h.get_by_role_and_label(Role::CheckBox, "Target printer: Floor 14 Laser").scroll_to_me();
+    h.run_steps(4);
+    h.get_by_role_and_label(Role::CheckBox, "Target printer: Floor 14 Laser").click();
+    h.run_steps(2);
+    assert!(h.state().print_draft.selected_printers.contains("Floor 14 Laser"));
+    h.get_by_label("Selected (3)");
+
+    // Instant search filter narrows visible cards, "Select All" adds filtered matches, and "Clear filter" restores the list.
+    h.get_by_role_and_label(Role::TextInput, "Filter printers by name");
+    h.state_mut().print_draft.printer_search_query = "Floor 12".into();
+    h.run_steps(2);
+    assert_eq!(h.state().print_draft.filtered_printers().len(), 1);
+    h.get_by_label("Select All").click();
+    h.run_steps(2);
+    assert!(h.state().print_draft.selected_printers.contains("Floor 12 Laser"));
+    h.get_by_label("Selected (4)");
+    h.get_by_role_and_label(Role::Button, "Clear printer filter").click();
+    h.run_steps(2);
+    assert!(h.state().print_draft.printer_search_query.is_empty());
+
+    // Save the 4-printer selection as a 1-click group, clear all, and restore all 4 in a single click.
+    h.get_by_label("+ Save Group").click();
+    h.run_steps(2);
+    h.state_mut().print_draft.new_group_name = Some("Executive Wing".into());
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::Button, "Save Group").click();
+    h.run_steps(2);
+    h.get_by_label("Clear").click();
+    h.run_steps(2);
+    assert!(h.state().print_draft.selected_printers.is_empty());
+    h.get_by_label("0 Selected");
+    h.get_by_label("Executive Wing (4)").click();
+    h.run_steps(2);
+    assert_eq!(h.state().print_draft.selected_printers.len(), 4);
+    h.get_by_label("Selected (4)");
+}
+
+#[test]
+fn zero_ms_quick_paper_pills_unblock_print_immediately_while_driver_paper_query_hangs() {
+    use pdfcraft_engine::print::spool::Printer;
+    use std::sync::{Arc, Mutex, mpsc};
+
+    let mut h = harness();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (started_tx, started_rx) = mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+
+    h.state_mut().printer_source = Some(Arc::new(|| {
+        vec![Printer { name: "Slow Network Printer".into(), default: true, two_sided: Some(true), description: String::new() }]
+    }));
+    let rx_clone = Arc::clone(&release_rx);
+    h.state_mut().printer_papers_source = Some(Arc::new(move |_| {
+        let _ = started_tx.send(());
+        let _ = rx_clone.lock().unwrap().recv();
+        vec![("A4".into(), (595.28, 841.89))]
+    }));
+    h.state_mut().default_paper_source = Some(Arc::new(|_| Some(("A4".into(), (595.28, 841.89)))));
+
+    assert!(h.state_mut().execute("print.dialog"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while h.state().print_draft.printers_loading && std::time::Instant::now() < deadline {
+        h.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let _ = started_rx.recv_timeout(std::time::Duration::from_secs(5));
+    h.run_steps(2);
+
+    assert!(h.state().print_draft.papers_loading(), "driver paper query is still hanging");
+    assert!(
+        h.get_by_role_and_label(Role::Button, "Print").accesskit_node().is_disabled(),
+        "Print waits until either driver finishes or user clicks a 0 ms paper pill"
+    );
+
+    // Clicking the 0 ms standard paper pill immediately overrides paper and enables Print without waiting!
+    h.get_by_label("A3 · 297×420").click();
+    h.run_steps(2);
+    assert!(h.state().print_draft.paper_overridden);
+    assert!(!h.state().print_draft.papers_loading());
+    assert_eq!(h.state().print_draft.paper_name(), "A3");
+    assert!(
+        !h.get_by_role_and_label(Role::Button, "Print").accesskit_node().is_disabled(),
+        "0 ms quick paper pill immediately enables Print while driver query is still pending"
+    );
+
+    h.get_by_label("Legal · 8.5×14").click();
+    h.run_steps(2);
+    assert_eq!(h.state().print_draft.paper_name(), "US Legal");
+
+    let _ = release_tx.send(());
+}
+
+#[test]
+fn unified_specs_broadcast_stamps_color_paper_duplex_and_orientation_to_all_selected_printers() {
+    use pdfcraft_engine::print::Orientation;
+    use pdfcraft_engine::print::spool::{
+        Duplex, Job, OPT_COLOR_INTENT, OPT_ORIENTATION, OPT_PAPER_UM, Printer,
+    };
+    use std::sync::{Arc, Mutex};
+
+    let mut h = harness();
+    let dispatched: Arc<Mutex<Vec<(usize, Job)>>> = Arc::default();
+    let sent = Arc::clone(&dispatched);
+
+    h.state_mut().printer_source = Some(Arc::new(|| {
+        vec![
+            Printer { name: "Exec Color".into(), default: true, two_sided: Some(true), description: String::new() },
+            Printer { name: "Finance Duplex".into(), default: false, two_sided: Some(true), description: String::new() },
+            Printer { name: "Lobby Simplex".into(), default: false, two_sided: Some(false), description: String::new() },
+        ]
+    }));
+    h.state_mut().printer_papers_source = Some(Arc::new(|_| Vec::new()));
+    h.state_mut().default_paper_source = Some(Arc::new(|_| None));
+    h.state_mut().spooler = Some(Arc::new(move |pdf: &[u8], job: &Job| {
+        sent.lock().unwrap().push((pdf.len(), job.clone()));
+        Ok("ok".into())
+    }));
+
+    assert!(h.state_mut().execute("print.dialog"));
+    settle(&mut h);
+
+    // Select all 3 physical printers in 1 click.
+    h.get_by_label("Select All").click();
+    h.run_steps(2);
+    h.get_by_label("Selected (3)");
+    h.get_by_label("Broadcast Pre-Flight (3 queues)");
+
+    // Set unified specifications once -> broadcast to all 3 selected printers:
+    h.get_by_role_and_label(Role::RadioButton, "Explicit B&W").click();
+    h.run_steps(1);
+    h.get_by_label("A3 · 297×420").click();
+    h.run_steps(1);
+    h.get_by_label("Long-Edge").click();
+    h.run_steps(1);
+    h.get_by_role_and_label(Role::RadioButton, "Landscape").click();
+    h.state_mut().print_draft.set_unified_copies(2);
+    h.run_steps(3);
+
+    assert!(h.state().print_draft.grayscale);
+    assert_eq!(h.state().print_draft.paper_name(), "A3");
+    assert_eq!(h.state().print_draft.duplex, Some(Duplex::LongEdge));
+    assert_eq!(h.state().print_draft.orientation, Orientation::Landscape);
+    h.get_by_label_contains("Simplex fallback active for: Lobby Simplex");
+
+    // Dispatch unified broadcast batch via the Print button.
+    h.get_by_role_and_label(Role::Button, "Print").click();
+    for _ in 0..500 {
+        h.run_steps(1);
+        if dispatched.lock().unwrap().len() == 3 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let jobs = dispatched.lock().unwrap().clone();
+    assert_eq!(jobs.len(), 3, "all 3 selected printers received simultaneous broadcast jobs");
+
+    let opt = |job: &Job, key: &str| -> Option<String> {
+        job.options.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    };
+
+    for (byte_len, job) in &jobs {
+        assert!(*byte_len > 100, "non-empty imposed PDF payload delivered to {:?}", job.printer);
+        assert_eq!(job.copies, 2);
+        assert!(job.grayscale, "explicit B&W stamped on {:?}", job.printer);
+        assert_eq!(opt(job, OPT_COLOR_INTENT).as_deref(), Some("monochrome"));
+        assert_eq!(opt(job, OPT_ORIENTATION).as_deref(), Some("landscape"));
+        assert_eq!(opt(job, OPT_PAPER_UM).as_deref(), Some("297000x420000"));
+        match job.printer.as_deref() {
+            Some("Exec Color" | "Finance Duplex") => {
+                assert_eq!(job.duplex, Some(Duplex::LongEdge), "duplex-capable printer gets LongEdge");
+            }
+            Some("Lobby Simplex") => {
+                assert_eq!(job.duplex, None, "simplex printer safely omits duplex override");
+            }
+            other => panic!("unexpected printer {other:?}"),
+        }
+    }
+}

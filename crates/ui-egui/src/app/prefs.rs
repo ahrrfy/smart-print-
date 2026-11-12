@@ -201,7 +201,16 @@ impl PdfCraftApp {
         v["print_printers"] = crate::print_ui::setups_to_json(&self.print_draft.setups);
         v["print_presets"] = serde_json::to_value(&self.print_draft.preset_store).unwrap_or_default();
         v["print_multi_mode"] = serde_json::Value::Bool(self.print_draft.multi_printer_mode);
+        v["print_hide_virtual"] = serde_json::Value::Bool(self.print_draft.hide_virtual_printers);
         v["print_selected_printers"] = serde_json::to_value(&self.print_draft.selected_printers).unwrap_or_default();
+        let persisted_broadcast = self
+            .print_draft
+            .broadcast_setup
+            .clone()
+            .or_else(|| self.print_draft.is_broadcast_active().then(|| self.print_draft.snapshot_broadcast_setup()));
+        v["print_broadcast_setup"] = persisted_broadcast
+            .as_ref()
+            .map_or(serde_json::Value::Null, crate::print_ui::broadcast_to_json);
         v.to_string()
     }
 
@@ -348,28 +357,6 @@ impl PdfCraftApp {
         if let Some(setups) = crate::print_ui::setups_from_json(&v["print_printers"]) {
             self.print_draft.setups = setups;
         }
-        if let Some(presets_val) = v.get("print_presets")
-            && let Ok(restored_store) = serde_json::from_value::<crate::workflows::print_presets::PrintPresetStore>(presets_val.clone())
-        {
-            let mut merged = crate::workflows::print_presets::PrintPresetStore::with_defaults();
-            for (k, p) in restored_store.presets {
-                if !p.is_built_in {
-                    merged.presets.insert(k, p);
-                }
-            }
-            merged.groups = restored_store.groups;
-            merged.active_preset_id = restored_store.active_preset_id.filter(|id| merged.presets.contains_key(id));
-            merged.active_group_id = restored_store.active_group_id.filter(|id| merged.groups.contains_key(id));
-            self.print_draft.preset_store = merged;
-        }
-        if let Some(multi) = v.get("print_multi_mode").and_then(serde_json::Value::as_bool) {
-            self.print_draft.multi_printer_mode = multi;
-        }
-        if let Some(sel_val) = v.get("print_selected_printers")
-            && let Ok(sel) = serde_json::from_value::<std::collections::BTreeSet<String>>(sel_val.clone())
-        {
-            self.print_draft.selected_printers = sel;
-        }
         // The Print dialog's remembered choices (#2001). Settings are untrusted: an unknown name
         // or a scale outside the dialog's range keeps the default. The scale is read before the
         // size mode, which carries it.
@@ -404,6 +391,48 @@ impl PdfCraftApp {
         }
         if let Some(dpi) = print["dpi"].as_f64().filter(|d| print_ui::IMAGE_DPI.contains(d)) {
             draft.dpi = dpi;
+        }
+        self.restore_cluster_print_prefs(v);
+    }
+
+    /// Restores multi-printer cluster state, presets, groups, and unified `BroadcastSetup`.
+    fn restore_cluster_print_prefs(&mut self, v: &serde_json::Value) {
+        if let Some(presets_val) = v.get("print_presets")
+            && let Ok(restored_store) = serde_json::from_value::<crate::workflows::print_presets::PrintPresetStore>(presets_val.clone())
+        {
+            let mut merged = crate::workflows::print_presets::PrintPresetStore::with_defaults();
+            for (k, p) in restored_store.presets {
+                if !p.is_built_in {
+                    merged.presets.insert(k, p);
+                }
+            }
+            merged.groups = restored_store.groups;
+            merged.active_preset_id = restored_store.active_preset_id.filter(|id| merged.presets.contains_key(id));
+            merged.active_group_id = restored_store.active_group_id.filter(|id| merged.groups.contains_key(id));
+            self.print_draft.preset_store = merged;
+        }
+        if let Some(multi) = v.get("print_multi_mode").and_then(serde_json::Value::as_bool) {
+            self.print_draft.multi_printer_mode = multi;
+        }
+        if let Some(hide_virt) = v.get("print_hide_virtual").and_then(serde_json::Value::as_bool) {
+            self.print_draft.hide_virtual_printers = hide_virt;
+        }
+        if let Some(sel_val) = v.get("print_selected_printers")
+            && let Ok(sel) = serde_json::from_value::<std::collections::BTreeSet<String>>(sel_val.clone())
+        {
+            self.print_draft.selected_printers = sel
+                .into_iter()
+                .filter(|name| !name.is_empty() && name.len() <= 1024 && name != crate::web_print::BROWSER_PRINTER)
+                .collect();
+            if self.print_draft.multi_printer_mode && self.print_draft.active_preview_printer.is_none() {
+                self.print_draft.active_preview_printer = self.print_draft.selected_printers.iter().next().cloned();
+            }
+        }
+        if let Some(bs) = crate::print_ui::broadcast_from_json(&v["print_broadcast_setup"]) {
+            if self.print_draft.is_broadcast_active() {
+                self.print_draft.apply_broadcast_setup(&bs);
+            }
+            self.print_draft.broadcast_setup = Some(bs);
         }
     }
 

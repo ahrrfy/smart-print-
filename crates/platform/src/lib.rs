@@ -22,12 +22,14 @@ pub mod caps;
 pub mod cups;
 pub mod diagnostics;
 pub mod mock;
+pub mod win32_unified;
 #[cfg(windows)]
 pub mod win32_v3;
 #[cfg(windows)]
 pub mod win32_v4;
 
 pub use disk::{get_default_spool_directory, query_disk_free_bytes, verify_spooler_disk_space};
+pub use win32_unified::install_print_bridge;
 pub use diagnostics::{
     collect_diagnostic_report, AppliedColorMode, AppliedOrientation, AppliedTicketTelemetry,
     DiagnosticReport, DiagnosticTraceBuffer, DriverGenerationKind, DuplexBindingKind, MarginsPt,

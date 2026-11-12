@@ -5,7 +5,7 @@
 //! Copies, the pages to print, orientation and the Multiple / Booklet / Poster layouts stay one
 //! job's choices, as before.
 
-use super::{CUSTOM_SCALE, SizeMode, print::names, spool::Duplex};
+use super::{CUSTOM_SCALE, Orientation, SizeMode, print::names, spool::Duplex};
 use crate::print_paper::is_paper_name;
 
 /// At most this many printers are remembered, the most recently printed to first (settings are
@@ -14,6 +14,8 @@ pub const MAX_PRINTERS: usize = 32;
 /// A longer printer name in the settings file is refused (CUPS and Windows queue names are far
 /// shorter).
 const MAX_NAME_BYTES: usize = 1024;
+/// Maximum copies accepted from restored untrusted settings.
+const MAX_RESTORED_COPIES: u64 = 9999;
 
 /// The paper, sizing and two-sided choice a printer was last printed with.
 #[derive(Clone, Debug, PartialEq)]
@@ -27,12 +29,140 @@ pub struct PrinterSetup {
     pub duplex: Option<Duplex>,
 }
 
+/// Unified broadcast specifications persisted across restarts for multi-printer workflows,
+/// preserving explicit Color vs. Black & White, paper name + exact dimensions, duplex,
+/// orientation, sizing/scaling, copies, and collation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BroadcastSetup {
+    /// Canonical or custom paper name.
+    pub paper: String,
+    /// Paper dimensions in points `(width_pt, height_pt)`.
+    pub paper_size_pt: (f64, f64),
+    /// `true` = Explicit Color (`DMCOLOR_COLOR`), `false` = Explicit Monochrome (`DMCOLOR_MONOCHROME`).
+    pub explicit_color: bool,
+    /// Two-sided choice (`Some(Duplex::Off)`, `Some(LongEdge)`, `Some(ShortEdge)`, or `None`).
+    pub duplex: Option<Duplex>,
+    /// Page orientation (`Auto`, `Portrait`, `Landscape`).
+    pub orientation: Orientation,
+    /// Page sizing mode (`Fit`, `Actual`, `Shrink`, `Custom`).
+    pub size: SizeMode,
+    /// The percent `SizeMode::Custom` prints at.
+    pub custom_scale: f64,
+    /// Copies per target printer (`>= 1`).
+    pub copies: u32,
+    /// Whether copies are collated.
+    pub collate: bool,
+    /// Whether `copies` and `orientation` carry across consecutive documents when broadcasting.
+    pub keep_specs_across_docs: bool,
+}
+
 /// Put `setup` first for `printer`, replacing what it had, and drop the oldest past
 /// [`MAX_PRINTERS`].
 pub fn record(setups: &mut Vec<(String, PrinterSetup)>, printer: &str, setup: PrinterSetup) {
     setups.retain(|(name, _)| name != printer);
     setups.insert(0, (printer.to_string(), setup));
     setups.truncate(MAX_PRINTERS);
+}
+
+/// Record `setup` for every printer in `printers` (used when broadcasting to a multi-printer cluster).
+pub fn record_many<'a>(
+    setups: &mut Vec<(String, PrinterSetup)>,
+    printers: impl IntoIterator<Item = &'a str>,
+    setup: &PrinterSetup,
+) {
+    let names: Vec<&'a str> = printers.into_iter().collect();
+    for printer in names.into_iter().rev() {
+        if !printer.is_empty() && printer.len() <= MAX_NAME_BYTES {
+            record(setups, printer, setup.clone());
+        }
+    }
+}
+
+fn orientation_name(orientation: Orientation) -> &'static str {
+    match orientation {
+        Orientation::Auto => "auto",
+        Orientation::Portrait => "portrait",
+        Orientation::Landscape => "landscape",
+    }
+}
+
+fn parse_orientation(name: &str) -> Option<Orientation> {
+    match name {
+        "auto" => Some(Orientation::Auto),
+        "portrait" => Some(Orientation::Portrait),
+        "landscape" => Some(Orientation::Landscape),
+        _ => None,
+    }
+}
+
+/// Serialize unified [`BroadcastSetup`] for the settings file.
+pub fn broadcast_to_json(s: &BroadcastSetup) -> serde_json::Value {
+    serde_json::json!({
+        "paper": s.paper,
+        "paper_size_pt": [s.paper_size_pt.0, s.paper_size_pt.1],
+        "explicit_color": s.explicit_color,
+        "duplex": names::duplex(s.duplex),
+        "orientation": orientation_name(s.orientation),
+        "size": names::size_mode(s.size),
+        "custom_scale": s.custom_scale,
+        "copies": s.copies.max(1),
+        "collate": s.collate,
+        "keep_specs_across_docs": s.keep_specs_across_docs,
+    })
+}
+
+/// Deserialize unified [`BroadcastSetup`] from untrusted settings JSON; returns `None` when absent or malformed.
+pub fn broadcast_from_json(v: &serde_json::Value) -> Option<BroadcastSetup> {
+    let obj = v.as_object()?;
+    let paper = obj.get("paper")?.as_str().filter(|n| is_paper_name(n))?.to_string();
+    let paper_size_pt = read_paper_size_pt(obj.get("paper_size_pt"), &paper)?;
+    let explicit_color = obj.get("explicit_color")?.as_bool()?;
+    let custom_scale = obj.get("custom_scale")?.as_f64().filter(|s| CUSTOM_SCALE.contains(s))?;
+    let size = names::parse_size_mode(obj.get("size")?.as_str()?, custom_scale)?;
+    let duplex = names::parse_duplex(obj.get("duplex")?.as_str()?)?;
+    let orientation = match obj.get("orientation").and_then(serde_json::Value::as_str) {
+        Some(o) => parse_orientation(o)?,
+        None => Orientation::Auto,
+    };
+    let copies = match obj.get("copies").and_then(serde_json::Value::as_u64) {
+        Some(c) if (1..=MAX_RESTORED_COPIES).contains(&c) => c as u32,
+        None => 1,
+        _ => return None,
+    };
+    let collate = obj.get("collate").and_then(serde_json::Value::as_bool).unwrap_or(true);
+    let keep_specs_across_docs = obj
+        .get("keep_specs_across_docs")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Some(BroadcastSetup {
+        paper,
+        paper_size_pt,
+        explicit_color,
+        duplex,
+        orientation,
+        size,
+        custom_scale,
+        copies,
+        collate,
+        keep_specs_across_docs,
+    })
+}
+
+fn read_paper_size_pt(val: Option<&serde_json::Value>, paper_name: &str) -> Option<(f64, f64)> {
+    if let Some(arr) = val.and_then(serde_json::Value::as_array)
+        && arr.len() == 2
+        && let (Some(w), Some(h)) = (arr[0].as_f64(), arr[1].as_f64())
+        && w.is_finite()
+        && h.is_finite()
+        && (72.0..=14_400.0).contains(&w)
+        && (72.0..=14_400.0).contains(&h)
+    {
+        return Some((w, h));
+    }
+    super::print::PAPERS
+        .iter()
+        .find(|(canonical, _)| *canonical == paper_name)
+        .map(|(_, sz)| *sz)
 }
 
 /// The setups for the settings file: the paper by its name (as `print_paper`), sizing and
@@ -163,5 +293,43 @@ mod tests {
             .map(|i| serde_json::json!({"printer": format!("Q{i}"), "paper": "A4", "size": "fit", "custom_scale": 100.0, "duplex": "printer"}))
             .collect();
         assert_eq!(from_json(&serde_json::Value::Array(many)).unwrap().len(), MAX_PRINTERS);
+    }
+
+    #[test]
+    fn broadcast_setup_round_trips_and_rejects_malformed_inputs() {
+        let bs = BroadcastSetup {
+            paper: "A4".into(),
+            paper_size_pt: (595.28, 841.89),
+            explicit_color: false,
+            duplex: Some(Duplex::LongEdge),
+            orientation: Orientation::Landscape,
+            size: SizeMode::Custom(85.0),
+            custom_scale: 85.0,
+            copies: 4,
+            collate: false,
+            keep_specs_across_docs: true,
+        };
+        let encoded = broadcast_to_json(&bs);
+        assert_eq!(broadcast_from_json(&encoded), Some(bs));
+
+        assert_eq!(broadcast_from_json(&serde_json::Value::Null), None);
+        assert_eq!(
+            broadcast_from_json(&serde_json::json!({
+                "paper": "A4",
+                "paper_size_pt": [595.28, 841.89],
+                "explicit_color": "yes",
+                "duplex": "long-edge",
+                "size": "fit",
+                "custom_scale": 100.0
+            })),
+            None
+        );
+
+        let mut setups = Vec::new();
+        record_many(&mut setups, ["HP_A", "Canon_B", "Ricoh_C"], &setup(4, SizeMode::Fit, Some(Duplex::Off)));
+        assert_eq!(setups.len(), 3);
+        assert_eq!(setups[0].0, "HP_A");
+        assert_eq!(setups[1].0, "Canon_B");
+        assert_eq!(setups[2].0, "Ricoh_C");
     }
 }

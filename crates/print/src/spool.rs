@@ -8,6 +8,90 @@ pub use craft_print::{
 
 #[cfg(any(windows, test))]
 mod windows_duplex;
+pub mod windows_unified;
+
+/// Internal `Job::options` key stamping explicit color vs. monochrome broadcast intent
+/// (`"color"` or `"monochrome"`). Stripped automatically before non-Windows CUPS `lp` submission.
+pub const OPT_COLOR_INTENT: &str = "pdfcraft:color_intent";
+
+/// Internal `Job::options` key stamping target physical paper size in micrometres
+/// (`"{w_um}x{h_um}"`, e.g. `"210000x297000"`). Stripped automatically before CUPS `lp` submission.
+pub const OPT_PAPER_UM: &str = "pdfcraft:paper_um";
+
+/// Internal `Job::options` key stamping explicit sheet orientation intent
+/// (`"portrait"`, `"landscape"`, or `"auto"`). Stripped automatically before CUPS `lp` submission.
+pub const OPT_ORIENTATION: &str = "pdfcraft:orientation";
+
+/// Driver preferences captured interactively from a reference printer's native `DocumentPropertiesW`
+/// dialog so they can be broadcast as normalized specifications across all selected printers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CapturedDriverTemplate {
+    pub paper_um: Option<(u32, u32)>,
+    pub paper_name: Option<String>,
+    pub grayscale: Option<bool>,
+    pub duplex: Option<Duplex>,
+    pub landscape: Option<bool>,
+    pub copies: Option<u32>,
+    pub collate: Option<bool>,
+}
+
+/// Platform bridge registered by `pdfcraft-platform` (`L7`) so `pdfcraft-print` (`L4`) can invoke
+/// native Win32 `DEVMODEW` normalization and interactive template capture without violating layer boundaries.
+pub trait WindowsUnifiedBridge: Send + Sync {
+    fn submit_unified(
+        &self,
+        pdf_bytes: &[u8],
+        job: &Job,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<String, crate::PrintError>;
+
+    fn capture_driver_template(
+        &self,
+        printer: &str,
+    ) -> Result<Option<CapturedDriverTemplate>, crate::PrintError>;
+}
+
+static WINDOWS_UNIFIED_BRIDGE: std::sync::RwLock<Option<&'static dyn WindowsUnifiedBridge>> =
+    std::sync::RwLock::new(None);
+
+/// Register the `L7` Windows unified driver bridge (`pdfcraft_platform::install_print_bridge`).
+pub fn register_windows_unified_bridge(bridge: &'static dyn WindowsUnifiedBridge) {
+    let mut slot = WINDOWS_UNIFIED_BRIDGE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = Some(bridge);
+}
+
+#[cfg(windows)]
+fn registered_bridge() -> Option<&'static dyn WindowsUnifiedBridge> {
+    *WINDOWS_UNIFIED_BRIDGE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Stamp unified broadcast specifications (`explicit_color`, `paper_um`, `landscape`) onto `job`.
+pub fn set_job_broadcast_specs(
+    job: &mut Job,
+    explicit_color: bool,
+    paper_um: (u32, u32),
+    landscape: Option<bool>,
+) {
+    windows_unified::apply_broadcast_specs(job, explicit_color, paper_um, landscape);
+}
+
+/// Whether `name` identifies a built-in interactive virtual save-to-file or fax queue
+/// (`Microsoft Print to PDF`, `Microsoft XPS Document Writer`, `OneNote`, `Fax`, etc.).
+pub fn is_virtual_save_printer(name: &str) -> bool {
+    windows_unified::is_virtual_save_queue(name)
+}
+
+/// Run `f` while holding the process-wide Windows PrintTicket provider lock (`PTOpenProvider`
+/// and calls on its handle). On non-Windows platforms this runs `f` directly.
+pub fn with_ticket_provider_lock<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(windows)]
+    let _provider = print_ticket_provider();
+    f()
+}
 
 /// Windows: the in-box DLLs printing draws and describes jobs with. The executables delay-load
 /// them (`apps/pdfcraft{,-cli}/build.rs`, and `build.rs` for this crate's tests: the same list)
@@ -97,8 +181,19 @@ pub fn xps_driver(printer: &str) -> Option<bool> {
         return None;
     }
     #[cfg(windows)]
-    let _provider = print_ticket_provider();
-    craft_print::xps_driver(printer)
+    {
+        let installed = winprint::printer::PrinterDevice::all()
+            .is_ok_and(|devices| devices.into_iter().any(|d| d.name() == printer));
+        if !installed {
+            return None;
+        }
+        let _provider = print_ticket_provider();
+        craft_print::xps_driver(printer)
+    }
+    #[cfg(not(windows))]
+    {
+        craft_print::xps_driver(printer)
+    }
 }
 
 /// Whether `printer`'s driver is a GDI (v3) one, which the XPS print API reaches through Windows'
@@ -119,8 +214,19 @@ pub fn two_sided(printer: &str) -> Option<bool> {
     #[cfg(all(windows, test))]
     PRINTER_BACKEND_CALLS.with(|c| c.set(c.get().saturating_add(1)));
     #[cfg(windows)]
-    let _provider = print_ticket_provider();
-    craft_print::two_sided(printer)
+    {
+        let installed = winprint::printer::PrinterDevice::all()
+            .is_ok_and(|devices| devices.into_iter().any(|d| d.name() == printer));
+        if !installed {
+            return None;
+        }
+        let _provider = print_ticket_provider();
+        craft_print::two_sided(printer)
+    }
+    #[cfg(not(windows))]
+    {
+        craft_print::two_sided(printer)
+    }
 }
 
 /// The driver's job options for a printer (CUPS: its PPD, with the queue's current defaults);
@@ -418,7 +524,10 @@ pub(crate) fn with_job_info(job: &Job, owner: Option<&str>) -> Job {
 }
 
 /// The job as the system spooler takes it.
+#[cfg_attr(windows, allow(dead_code))]
 fn spooled(job: &Job) -> Job {
+    let cleaned = windows_unified::strip_internal_options(job);
+    let job = &cleaned;
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     let job = &with_ppd_media(job, |printer| ppd_papers_in(printer, std::path::Path::new("/etc/cups/ppd")));
     #[cfg(target_os = "macos")]
@@ -437,13 +546,14 @@ pub fn submit(pdf: &[u8], job: &Job) -> Result<String, crate::PrintError> {
         return Err(unavailable(dll));
     }
     #[cfg(windows)]
-    let _provider = print_ticket_provider();
-    #[cfg(windows)]
-    let resolved = windows_duplex::job(job);
-    #[cfg(windows)]
-    let job = resolved.as_ref();
-    let pdf = spooled_pdf(pdf, crate::font_names::RENAME_FOR_SPOOLER);
-    craft_print::submit(&pdf, &spooled(job)).map_err(|e| crate::PrintError::Spool(e.to_string()))
+    {
+        submit_windows(pdf, job, &mut |_, _| {})
+    }
+    #[cfg(not(windows))]
+    {
+        let pdf = spooled_pdf(pdf, crate::font_names::RENAME_FOR_SPOOLER);
+        craft_print::submit(&pdf, &spooled(job)).map_err(|e| crate::PrintError::Spool(e.to_string()))
+    }
 }
 
 /// [`submit`], told `(sent, sheets)` as each sheet reaches the spooler (Windows; CUPS takes the
@@ -453,13 +563,26 @@ pub fn submit_with_progress(pdf: &[u8], job: &Job, progress: &mut dyn FnMut(usiz
         return Err(unavailable(dll));
     }
     #[cfg(windows)]
-    let _provider = print_ticket_provider();
-    #[cfg(windows)]
+    {
+        submit_windows(pdf, job, progress)
+    }
+    #[cfg(not(windows))]
+    {
+        let pdf = spooled_pdf(pdf, crate::font_names::RENAME_FOR_SPOOLER);
+        craft_print::submit_with_progress(&pdf, &spooled(job), progress).map_err(|e| crate::PrintError::Spool(e.to_string()))
+    }
+}
+
+#[cfg(windows)]
+fn submit_windows(pdf: &[u8], job: &Job, progress: &mut dyn FnMut(usize, usize)) -> Result<String, crate::PrintError> {
     let resolved = windows_duplex::job(job);
-    #[cfg(windows)]
     let job = resolved.as_ref();
     let pdf = spooled_pdf(pdf, crate::font_names::RENAME_FOR_SPOOLER);
-    craft_print::submit_with_progress(&pdf, &spooled(job), progress).map_err(|e| crate::PrintError::Spool(e.to_string()))
+    if let Some(bridge) = registered_bridge() {
+        bridge.submit_unified(&pdf, job, progress)
+    } else {
+        windows_unified::submit_with_seed(&pdf, job, None, progress)
+    }
 }
 
 /// The PDF as the system spooler takes it: with `rename` (Windows), its embedded TrueType and
@@ -492,18 +615,26 @@ pub fn printer_papers(printer: &str) -> Vec<Paper> {
     if missing_print_dll().is_some() {
         return Vec::new();
     }
-    let _provider = print_ticket_provider();
-    printer_papers_internal(printer)
+    printer_papers_internal(printer).unwrap_or_default()
 }
 
+/// Returns `None` when `printer` is not an installed Windows print queue, or `Some(papers)`
+/// when `printer` exists in `PrinterDevice::all()`, holding `print_ticket_provider()` strictly
+/// around `PrintCapabilities::fetch(&device)`.
 #[cfg(windows)]
-fn printer_papers_internal(printer: &str) -> Vec<Paper> {
+fn printer_papers_internal(printer: &str) -> Option<Vec<Paper>> {
     #[cfg(test)]
     PRINTER_BACKEND_CALLS.with(|c| c.set(c.get().saturating_add(1)));
     use winprint::ticket::{FeatureOptionPack as _, FeatureOptionPackWithPredefined as _};
-    let Ok(devices) = winprint::printer::PrinterDevice::all() else { return Vec::new() };
-    let Some(device) = devices.into_iter().find(|d| d.name() == printer) else { return Vec::new() };
-    let Ok(capabilities) = winprint::ticket::PrintCapabilities::fetch(&device) else { return Vec::new() };
+    let devices = winprint::printer::PrinterDevice::all().ok()?;
+    let device = devices.into_iter().find(|d| d.name() == printer)?;
+    let capabilities = {
+        let _provider = print_ticket_provider();
+        winprint::ticket::PrintCapabilities::fetch(&device).ok()
+    };
+    let Some(capabilities) = capabilities else {
+        return Some(Vec::new());
+    };
     let mut papers = Vec::new();
     for media in capabilities.page_media_sizes() {
         let size = media.size();
@@ -520,7 +651,7 @@ fn printer_papers_internal(printer: &str) -> Vec<Paper> {
             }
         }
     }
-    papers
+    Some(papers)
 }
 
 /// The paper sizes supported by `printer` on CUPS: its PPD's (see [`cups_paper_info`]); none on
@@ -751,20 +882,19 @@ pub fn printer_paper_info(printer: &str) -> (Vec<Paper>, Option<Paper>) {
         return (Vec::new(), None);
     }
     #[cfg(windows)]
-    let _provider = print_ticket_provider();
-    #[cfg(windows)]
-    let papers = printer_papers_internal(printer);
-    #[cfg(not(windows))]
-    let (papers, cups_default) = cups_paper_info(printer);
-    #[cfg(windows)]
-    let default_paper = {
+    {
+        let Some(papers) = printer_papers_internal(printer) else {
+            return (Vec::new(), None);
+        };
         let settings = craft_print::rgb::default_settings(printer).ok();
         let page = settings.as_ref().and_then(|s| craft_print::rgb::page(printer, Some(s)).ok());
-        page.map(|p| resolve_paper_name(&papers, p.paper))
-    };
+        let default_paper = page.map(|p| resolve_paper_name(&papers, p.paper));
+        (papers, default_paper)
+    }
     #[cfg(not(windows))]
-    let default_paper = cups_default;
-    (papers, default_paper)
+    {
+        cups_paper_info(printer)
+    }
 }
 
 /// Shows the printer driver's Page Setup / DocumentProperties dialog (Windows).
@@ -793,6 +923,37 @@ pub fn show_printer_properties(printer: &str, parent: Option<isize>) -> Result<O
     #[cfg(not(windows))]
     {
         let _ = (printer, parent);
+        Ok(None)
+    }
+}
+
+/// Opens a reference printer's per-job `DocumentPropertiesW` dialog (Windows) without mutating OS
+/// global defaults, and returns normalized broadcast specifications (`CapturedDriverTemplate`) so
+/// the caller can apply them across all selected printers.
+pub fn capture_driver_template(printer: &str) -> Result<Option<CapturedDriverTemplate>, crate::PrintError> {
+    if let Some(dll) = missing_print_dll() {
+        return Err(unavailable(dll));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(bridge) = registered_bridge() {
+            return bridge.capture_driver_template(printer);
+        }
+        let devmode = match craft_print::rgb::settings_dialog(printer, None, None) {
+            Ok(Some(dm)) => dm,
+            Ok(None) => return Ok(None),
+            Err(_) => {
+                open_printer_preferences(printer)?;
+                return Ok(None);
+            }
+        };
+        let page = craft_print::rgb::page(printer, Some(&devmode)).ok().map(|p| p.paper);
+        let papers = printer_papers(printer);
+        Ok(windows_unified::parse_devmode_template_bytes(devmode.as_bytes(), page, &papers))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = printer;
         Ok(None)
     }
 }

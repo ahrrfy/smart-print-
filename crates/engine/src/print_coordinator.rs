@@ -2,15 +2,19 @@
 //! per-printer ledger tracking, stream health monitoring, and one-click failover rerouting.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use pdfcraft_print::{Settings, layout, sheet_pages};
+use pdfcraft_print::governor::{
+    ConcurrencyGovernor, GovernorError, PrinterJobEstimate, SheetRasterMode,
+    calculate_required_spool_bytes,
+};
+use pdfcraft_print::{Settings, Sheet, layout};
 
-/// Stall detection timeout: if a stream receives no progress updates for this duration,
-/// it transitions to `StreamHealth::Stalled`.
+/// Stall detection timeout: if an actively spooling stream receives no progress updates for this
+/// duration, it transitions to `StreamHealth::Stalled`.
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Low-bandwidth threshold in KB/s below which an active stream is marked as `StreamHealth::Throttled`.
@@ -19,26 +23,67 @@ pub const THROTTLE_THRESHOLD_KBPS: f64 = 25.0;
 /// Shared read-only PDF document bytes backing concurrent print workers.
 pub use crate::snapshot::SharedPdfSource;
 
-/// Cooperative cancellation token shared across supervisor, workers, and UI.
-#[derive(Clone, Default, Debug)]
-pub struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
+/// Cooperative cancellation token shared across supervisor, workers, governor, and UI.
+pub use pdfcraft_print::governor::CancellationToken;
+
+/// Background builder closure producing a print-ready PDF for `Settings`.
+pub type PreparedPdfBuilderFn =
+    Arc<dyn Fn(&Settings) -> Result<Vec<u8>, String> + Send + Sync>;
+
+/// Thread-safe snapshot of an open document's printable state, captured in O(1) on the UI thread
+/// so heavy imposition, decryption, form/comment synthesis, or rasterization can execute on a
+/// background worker thread without blocking UI frames.
+#[derive(Clone)]
+pub struct PreparedPrintSource {
+    builder: PreparedPdfBuilderFn,
 }
 
-impl CancellationToken {
-    pub fn new() -> Self {
+impl PreparedPrintSource {
+    /// Wraps a thread-safe print-ready PDF builder closure.
+    pub fn from_builder<F>(builder: F) -> Self
+    where
+        F: Fn(&Settings) -> Result<Vec<u8>, String> + Send + Sync + 'static,
+    {
         Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
+            builder: Arc::new(builder),
         }
     }
 
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+    /// Builds the print-ready imposed PDF for `settings` safely on any background worker thread.
+    pub fn build_pdf(&self, settings: &Settings) -> Result<Vec<u8>, String> {
+        (self.builder)(settings)
     }
+}
 
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+/// Analytical spool disk footprint estimator for a multi-printer batch.
+pub fn estimate_batch_spool_bytes(
+    total_sheets: usize,
+    jobs: &[&pdfcraft_print::spool::Job],
+    is_raster: bool,
+) -> u64 {
+    let mode = if is_raster {
+        SheetRasterMode::Raster300Dpi
+    } else {
+        SheetRasterMode::Vector
+    };
+    let estimates: Vec<PrinterJobEstimate> = jobs
+        .iter()
+        .map(|j| PrinterJobEstimate::new(total_sheets, j.copies.max(1) as usize, mode))
+        .collect();
+    calculate_required_spool_bytes(&estimates)
+}
+
+/// Checks whether `name` is a virtual file-saving or fax printer unsuitable for unattended failover.
+fn is_virtual_save_queue(name: &str) -> bool {
+    if pdfcraft_print::is_virtual_save_printer(name) {
+        return true;
     }
+    let lower = name.trim().to_ascii_lowercase();
+    lower.contains("microsoft print to pdf")
+        || lower.contains("xps document writer")
+        || lower.contains("onenote")
+        || lower == "fax"
+        || lower.ends_with(" fax")
 }
 
 /// Per-printer ledger tracking sheets committed to the spooler vs. sheets pending.
@@ -139,7 +184,7 @@ pub enum StreamHealth {
         rate_kbps: f64,
         reason: String,
     },
-    /// No progress updates received within `STALL_TIMEOUT`.
+    /// No progress updates received within `STALL_TIMEOUT` during active transmission.
     Stalled {
         stalled_duration_secs: u64,
     },
@@ -254,8 +299,8 @@ pub type SpoolSubmitFn = Arc<
         + Sync,
 >;
 
-/// Shared lazy K-only monochrome conversion cache across concurrent workers in a batch.
-type SharedMonoCache = Arc<std::sync::OnceLock<Option<Arc<Vec<u8>>>>>;
+/// Wakeup callback invoked whenever a `CoordinatorEvent` is emitted (e.g. `egui::Context::request_repaint`).
+pub type EventWakeupFn = Arc<dyn Fn() + Send + Sync>;
 
 /// Full configuration for dispatching a unified print batch across one or multiple printers.
 pub struct BatchDispatchConfig {
@@ -269,13 +314,255 @@ pub struct BatchDispatchConfig {
     pub default_job: pdfcraft_print::spool::Job,
     /// Optional pre-imposed print-ready PDF bytes (e.g. from `Session::print_pdf`, preserving unsaved edits, form fields, annotations, and layers).
     pub pre_imposed_pdf: Option<Arc<Vec<u8>>>,
-    /// Optional custom spooler hook (defaults to OS `pdfcraft_print::spool::submit_with_progress`).
+    /// Optional custom spooler hook (defaults to `None` in production so OS `gdi_driver` and `two_sided` run).
     pub custom_spooler: Option<SpoolSubmitFn>,
+    /// Optional UI wakeup callback invoked whenever a worker emits an event, decoupled from `custom_spooler`.
+    pub on_event_wakeup: Option<EventWakeupFn>,
+}
+
+/// Event channel paired with an optional wakeup callback.
+#[derive(Clone)]
+struct EventNotifier {
+    tx: Sender<CoordinatorEvent>,
+    wakeup: Option<EventWakeupFn>,
+}
+
+impl EventNotifier {
+    fn send(&self, event: CoordinatorEvent) {
+        let _ = self.tx.send(event);
+        if let Some(ref wakeup) = self.wakeup {
+            wakeup();
+        }
+    }
+}
+
+/// Zero-copy per-batch spool adaptation cache (`OnceLock`-memoized across concurrent workers).
+struct BatchSpoolBuffer {
+    base: Arc<Vec<u8>>,
+    color_tiled: OnceLock<Arc<Vec<u8>>>,
+    color_flattened: OnceLock<Arc<Vec<u8>>>,
+    mono_tiled: OnceLock<Option<Arc<Vec<u8>>>>,
+    mono_flattened: OnceLock<Option<Arc<Vec<u8>>>>,
+}
+
+impl BatchSpoolBuffer {
+    fn new(base: Arc<Vec<u8>>) -> Self {
+        Self {
+            base,
+            color_tiled: OnceLock::new(),
+            color_flattened: OnceLock::new(),
+            mono_tiled: OnceLock::new(),
+            mono_flattened: OnceLock::new(),
+        }
+    }
+
+    fn color_ready(&self) -> &Arc<Vec<u8>> {
+        self.color_tiled.get_or_init(|| {
+            if !cfg!(windows) {
+                return self.base.clone();
+            }
+            let mut probe = pdfcraft_print::spool::Job::default();
+            Arc::new(crate::spooler::spooler_copy(
+                self.base.as_ref().clone(),
+                &mut probe,
+                false,
+            ))
+        })
+    }
+
+    fn mono_ready(&self) -> Option<&Arc<Vec<u8>>> {
+        self.mono_tiled
+            .get_or_init(|| {
+                let mut probe = pdfcraft_print::spool::Job {
+                    grayscale: true,
+                    grey_pages: false,
+                    ..Default::default()
+                };
+                let stage1 = crate::spooler::spooler_copy(
+                    self.base.as_ref().clone(),
+                    &mut probe,
+                    false,
+                );
+                let filtered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pdfcraft_print::monochrome::MonochromeVectorFilter::filter_document_to_k_only(
+                        &stage1,
+                    )
+                    .ok()
+                }))
+                .ok()
+                .flatten();
+                match filtered {
+                    Some(bytes) => Some(Arc::new(bytes)),
+                    None if probe.grey_pages => Some(Arc::new(stage1)),
+                    None => None,
+                }
+            })
+            .as_ref()
+    }
+
+    fn for_job(&self, job: &mut pdfcraft_print::spool::Job, flatten_transparency: bool) -> Arc<Vec<u8>> {
+        if job.grayscale {
+            if flatten_transparency && cfg!(windows) {
+                let flat_opt = self.mono_flattened.get_or_init(|| {
+                    let mono = self.mono_ready()?.clone();
+                    let mut probe = pdfcraft_print::spool::Job {
+                        grayscale: true,
+                        grey_pages: true,
+                        ..Default::default()
+                    };
+                    Some(Arc::new(crate::spooler::spooler_copy(
+                        mono.as_ref().clone(),
+                        &mut probe,
+                        true,
+                    )))
+                });
+                if let Some(buf) = flat_opt {
+                    job.grey_pages = true;
+                    return buf.clone();
+                }
+            } else if let Some(mono) = self.mono_ready() {
+                job.grey_pages = true;
+                return mono.clone();
+            }
+        }
+
+        if flatten_transparency && cfg!(windows) {
+            return self
+                .color_flattened
+                .get_or_init(|| {
+                    let mut probe = pdfcraft_print::spool::Job::default();
+                    Arc::new(crate::spooler::spooler_copy(
+                        self.base.as_ref().clone(),
+                        &mut probe,
+                        true,
+                    ))
+                })
+                .clone();
+        }
+
+        self.color_ready().clone()
+    }
+
+    fn slice_sheets(
+        &self,
+        sheet_indices: &[usize],
+        job: &mut pdfcraft_print::spool::Job,
+        flatten_transparency: bool,
+    ) -> Result<Arc<Vec<u8>>, String> {
+        let (source_arc, grey_converted) = if job.grayscale {
+            match self.mono_ready() {
+                Some(mono) => (mono.clone(), true),
+                None => (self.color_ready().clone(), false),
+            }
+        } else {
+            (self.color_ready().clone(), false)
+        };
+
+        let doc = pdfcraft_cos::Document::open(source_arc)
+            .map_err(|e| format!("Failed to open imposed PDF for failover slice: {e}"))?;
+        let total = pdfcraft_model::pages(&doc).len();
+        if sheet_indices.len() == total && sheet_indices.iter().copied().eq(0..total) {
+            return Ok(self.for_job(job, flatten_transparency));
+        }
+
+        let sliced_doc = pdfcraft_organize::extract_pages(&doc, sheet_indices)
+            .map_err(|e| format!("Failed to slice remaining imposed sheets: {e}"))?;
+        let mut sliced_bytes =
+            pdfcraft_cos::write_full(&sliced_doc, &pdfcraft_cos::SaveOptions::default())
+                .map_err(|e| format!("Failed to serialize sliced failover PDF: {e}"))?;
+
+        if grey_converted {
+            job.grey_pages = true;
+        }
+        if flatten_transparency && cfg!(windows) {
+            let mut probe = pdfcraft_print::spool::Job {
+                grayscale: job.grayscale,
+                grey_pages: true,
+                ..Default::default()
+            };
+            sliced_bytes = crate::spooler::spooler_copy(sliced_bytes, &mut probe, true);
+        }
+        Ok(Arc::new(sliced_bytes))
+    }
+}
+
+/// Shared lazy preparation cache for an entire print batch.
+/// Ensures imposition, unified grayscale/K-only conversion, large-image tiling, and GDI flattening
+/// happen at most once across all workers and remain available for zero-reimposition failover.
+struct BatchPreparedCache {
+    doc_source: SharedPdfSource,
+    prepared_source: Option<PreparedPrintSource>,
+    settings: Settings,
+    governor: Arc<ConcurrencyGovernor>,
+    spool_buffer: OnceLock<Result<Arc<BatchSpoolBuffer>, String>>,
+}
+
+impl BatchPreparedCache {
+    fn new(
+        doc_source: SharedPdfSource,
+        prepared_source: Option<PreparedPrintSource>,
+        pre_imposed_pdf: Option<Arc<Vec<u8>>>,
+        settings: Settings,
+        governor: Arc<ConcurrencyGovernor>,
+    ) -> Self {
+        let spool_buffer = OnceLock::new();
+        if let Some(imposed) = pre_imposed_pdf {
+            let _ = spool_buffer.set(Ok(Arc::new(BatchSpoolBuffer::new(imposed))));
+        }
+        Self {
+            doc_source,
+            prepared_source,
+            settings,
+            governor,
+            spool_buffer,
+        }
+    }
+
+    fn resolve(&self, cancel_token: &CancellationToken) -> Result<Arc<BatchSpoolBuffer>, String> {
+        if let Some(existing) = self.spool_buffer.get() {
+            return existing.clone();
+        }
+        let _cpu_permit = self
+            .governor
+            .acquire_cpu_permit(cancel_token)
+            .map_err(governor_err_string)?;
+        self.spool_buffer
+            .get_or_init(|| self.build_imposed_buffer())
+            .clone()
+    }
+
+    fn build_imposed_buffer(&self) -> Result<Arc<BatchSpoolBuffer>, String> {
+        if let Some(ref prepared) = self.prepared_source {
+            let imposed = prepared
+                .build_pdf(&self.settings)
+                .map_err(|e| format!("Print preparation failure: {e}"))?;
+            return Ok(Arc::new(BatchSpoolBuffer::new(Arc::new(imposed))));
+        }
+
+        let doc_arc = match &self.doc_source {
+            #[cfg(not(target_arch = "wasm32"))]
+            SharedPdfSource::Mmap(m) => Arc::new(m.as_ref().to_vec()),
+            SharedPdfSource::Heap(h) => h.clone(),
+        };
+        let cos_doc = pdfcraft_cos::Document::open(doc_arc)
+            .map_err(|e| format!("Failed to open PDF document: {e}"))?;
+        let imposed = pdfcraft_print::impose(&cos_doc, &self.settings)
+            .map_err(|e| format!("Imposition failure: {e}"))?;
+        Ok(Arc::new(BatchSpoolBuffer::new(Arc::new(imposed))))
+    }
+}
+
+fn governor_err_string(err: GovernorError) -> String {
+    match err {
+        GovernorError::Cancelled => "Cancelled by operator".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Control structure for an individual worker.
 struct WorkerControl {
     cancel_token: CancellationToken,
+    spooling_active: Arc<AtomicBool>,
 }
 
 /// Control handle for an active multi-printer print batch.
@@ -283,13 +570,13 @@ pub struct MultiJobHandle {
     pub batch_id: u64,
     workers: HashMap<String, WorkerControl>,
     event_rx: Receiver<CoordinatorEvent>,
-    event_tx: Sender<CoordinatorEvent>,
+    notifier: EventNotifier,
     telemetry: HashMap<String, PrinterStreamTelemetry>,
     master_cancel: CancellationToken,
-    doc_source: SharedPdfSource,
-    original_settings: Settings,
-    page_sizes: Vec<(f64, f64)>,
-    sheet_to_pages: Vec<Vec<usize>>,
+    batch_cache: Arc<BatchPreparedCache>,
+    batch_sheets: Vec<Sheet>,
+    worker_sheet_map: HashMap<String, Vec<usize>>,
+    worker_duplex: HashMap<String, bool>,
     printer_jobs: HashMap<String, pdfcraft_print::spool::Job>,
     default_job: pdfcraft_print::spool::Job,
     custom_spooler: Option<SpoolSubmitFn>,
@@ -297,7 +584,8 @@ pub struct MultiJobHandle {
 
 impl MultiJobHandle {
     /// Non-blocking event poll called on the UI thread (<0.2ms per frame).
-    /// Drains available events, updates internal telemetry, and detects stalled streams.
+    /// Drains available events, updates internal telemetry, and checks `STALL_TIMEOUT` only on
+    /// streams that have actively entered spool transmission.
     pub fn poll_events(&mut self) -> Vec<CoordinatorEvent> {
         let mut received = Vec::new();
         let mut drained = 0;
@@ -314,7 +602,16 @@ impl MultiJobHandle {
 
         let now = Instant::now();
         for (name, tel) in self.telemetry.iter_mut() {
-            if matches!(tel.health, StreamHealth::Healthy { .. } | StreamHealth::Throttled { .. }) {
+            let is_active = self
+                .workers
+                .get(name)
+                .is_some_and(|w| w.spooling_active.load(Ordering::Acquire));
+            if is_active
+                && matches!(
+                    tel.health,
+                    StreamHealth::Healthy { .. } | StreamHealth::Throttled { .. }
+                )
+            {
                 let elapsed = now.duration_since(tel.last_progress_time);
                 if elapsed >= STALL_TIMEOUT {
                     tel.health = StreamHealth::Stalled {
@@ -336,7 +633,11 @@ impl MultiJobHandle {
             CoordinatorEvent::ProgressUpdate(tel) => {
                 self.telemetry.insert(tel.printer_name.clone(), tel.clone());
             }
-            CoordinatorEvent::PrinterCompleted { printer_name, total_sheets, duration_secs } => {
+            CoordinatorEvent::PrinterCompleted {
+                printer_name,
+                total_sheets,
+                duration_secs,
+            } => {
                 if let Some(tel) = self.telemetry.get_mut(printer_name) {
                     tel.health = StreamHealth::Completed {
                         total_sheets: *total_sheets,
@@ -345,7 +646,13 @@ impl MultiJobHandle {
                     tel.ledger.mark_committed_up_to(*total_sheets);
                 }
             }
-            CoordinatorEvent::PrinterFailed { printer_name, error, committed_sheets, pending_sheets, .. } => {
+            CoordinatorEvent::PrinterFailed {
+                printer_name,
+                error,
+                committed_sheets,
+                pending_sheets,
+                ..
+            } => {
                 if let Some(tel) = self.telemetry.get_mut(printer_name) {
                     tel.health = StreamHealth::Faulted {
                         error: error.clone(),
@@ -366,6 +673,27 @@ impl MultiJobHandle {
             }
             _ => {}
         }
+    }
+
+    /// Selects the first non-busy, non-virtual backup printer from `candidates` for failover.
+    pub fn suggest_failover_target(&self, from_printer: &str, candidates: &[String]) -> Option<String> {
+        candidates
+            .iter()
+            .find(|candidate| {
+                let name = candidate.as_str();
+                if name == from_printer || is_virtual_save_queue(name) {
+                    return false;
+                }
+                !self.telemetry.get(name).is_some_and(|tel| {
+                    matches!(
+                        tel.health,
+                        StreamHealth::Healthy { .. }
+                            | StreamHealth::Throttled { .. }
+                            | StreamHealth::Stalled { .. }
+                    )
+                })
+            })
+            .cloned()
     }
 
     /// Gets current telemetry for a printer.
@@ -397,6 +725,7 @@ impl MultiJobHandle {
     pub fn cancel_printer(&mut self, printer_name: &str) -> bool {
         if let Some(worker) = self.workers.get(printer_name) {
             worker.cancel_token.cancel();
+            worker.spooling_active.store(false, Ordering::Release);
             true
         } else {
             false
@@ -408,6 +737,7 @@ impl MultiJobHandle {
         self.master_cancel.cancel();
         for worker in self.workers.values() {
             worker.cancel_token.cancel();
+            worker.spooling_active.store(false, Ordering::Release);
         }
     }
 
@@ -415,24 +745,53 @@ impl MultiJobHandle {
     pub fn is_all_completed(&self) -> bool {
         !self.telemetry.is_empty()
             && self.telemetry.values().all(|t| {
-                matches!(t.health, StreamHealth::Completed { .. } | StreamHealth::Faulted { .. })
+                matches!(
+                    t.health,
+                    StreamHealth::Completed { .. } | StreamHealth::Faulted { .. }
+                )
             })
     }
 
-    /// Executes one-click failover: slices pending sheets from `from_printer`, adapts margins,
-    /// and dispatches to `to_printer` with zero duplicate pages.
+    /// Computes global imposed sheet indices to reroute from `from_printer`, aligning duplex jobs
+    /// to even physical leaf boundaries `(first_pending / 2) * 2` so front/back pairing never shifts.
+    fn compute_failover_global_sheets(&self, from_printer: &str, pending_local: &[usize], local_total: usize) -> Vec<usize> {
+        let is_duplex = self.worker_duplex.get(from_printer).copied().unwrap_or(false);
+        let first_pending = pending_local.first().copied().unwrap_or(local_total);
+        let resume_local = if is_duplex {
+            (first_pending / 2) * 2
+        } else {
+            first_pending
+        };
+
+        let local_indices: Vec<usize> = (resume_local..local_total)
+            .filter(|&idx| idx < first_pending || pending_local.contains(&idx))
+            .collect();
+
+        match self.worker_sheet_map.get(from_printer) {
+            Some(map) => local_indices
+                .into_iter()
+                .filter_map(|local_idx| map.get(local_idx).copied())
+                .collect(),
+            None => local_indices,
+        }
+    }
+
+    /// Executes one-click failover: slices remaining imposed sheets directly via
+    /// `pdfcraft_organize::extract_pages` (preserving encryption, form fields, rasterization,
+    /// Poster/Booklet layouts, and duplex leaf alignment) and dispatches to `to_printer`.
     pub fn failover_reroute(&mut self, from_printer: &str, to_printer: &str) -> Result<(), FailoverError> {
         if self.master_cancel.is_cancelled() {
             return Err(FailoverError::BatchCancelled);
         }
 
-        let from_tel = self
-            .telemetry
-            .get(from_printer)
-            .ok_or_else(|| FailoverError::PrinterNotFound(from_printer.to_string()))?;
-
-        let pending_sheets = from_tel.ledger.slice_for_failover();
-        if pending_sheets.is_empty() {
+        let (pending_local, local_total) = {
+            let from_tel = self
+                .telemetry
+                .get(from_printer)
+                .ok_or_else(|| FailoverError::PrinterNotFound(from_printer.to_string()))?;
+            (from_tel.ledger.slice_for_failover(), from_tel.ledger.total_sheets)
+        };
+        if pending_local.is_empty() {
             return Err(FailoverError::NoPendingSheets(from_printer.to_string()));
         }
 
@@ -451,29 +810,18 @@ impl MultiJobHandle {
             return Err(FailoverError::TargetPrinterBusy(to_printer.to_string()));
         }
 
-        let mut pending_pages = Vec::new();
-        for &sheet_idx in &pending_sheets {
-            if let Some(pages) = self.sheet_to_pages.get(sheet_idx) {
-                for &p in pages {
-                    if !pending_pages.contains(&p) {
-                        pending_pages.push(p);
-                    }
-                }
-            }
+        let global_slice = self.compute_failover_global_sheets(from_printer, &pending_local, local_total);
+        if global_slice.is_empty() {
+            return Err(FailoverError::NoPendingSheets(from_printer.to_string()));
         }
+        let target_total_sheets = global_slice.len();
 
-        let mut target_settings = self.original_settings.clone();
-        target_settings.pages = pending_pages;
-
-        let target_sheets = layout(&self.page_sizes, &target_settings)
-            .map_err(|e| FailoverError::LayoutError(to_printer.to_string(), e.to_string()))?;
-        let target_sheet_to_pages = sheet_pages(&target_sheets);
-        let target_total_sheets = target_sheets.len();
-
-        // Halt the stalled/failed printer thread and prevent duplicate page printing
         self.cancel_printer(from_printer);
         if let Some(from_tel_mut) = self.telemetry.get_mut(from_printer)
-            && !matches!(from_tel_mut.health, StreamHealth::Faulted { .. } | StreamHealth::Completed { .. })
+            && !matches!(
+                from_tel_mut.health,
+                StreamHealth::Faulted { .. } | StreamHealth::Completed { .. }
+            )
         {
             from_tel_mut.health = StreamHealth::Faulted {
                 error: format!("Failover rerouted to '{to_printer}'"),
@@ -481,33 +829,32 @@ impl MultiJobHandle {
             };
         }
 
-        let worker_cancel = CancellationToken::new();
         let mut target_job = self
             .printer_jobs
             .get(to_printer)
             .cloned()
             .unwrap_or_else(|| self.default_job.clone());
         target_job.printer = Some(to_printer.to_string());
-        if matches!(
+        refresh_cups_orientation_for_slice(&mut target_job, &self.batch_sheets, &global_slice);
+
+        let target_is_duplex = matches!(
             target_job.duplex,
             Some(pdfcraft_print::spool::Duplex::LongEdge | pdfcraft_print::spool::Duplex::ShortEdge)
-        ) && self.custom_spooler.is_none()
-            && pdfcraft_print::spool::two_sided(to_printer) == Some(false)
-        {
-            target_job.duplex = None;
-        }
+        );
+        let worker_cancel = CancellationToken::new();
+        let spooling_active = Arc::new(AtomicBool::new(false));
 
         let task = WorkerTask {
             printer_name: to_printer.to_string(),
-            settings: target_settings,
-            doc_source: self.doc_source.clone(),
-            pre_imposed_pdf: None,
-            mono_cache: Arc::new(std::sync::OnceLock::new()),
+            batch_cache: self.batch_cache.clone(),
+            slice_sheets: Some(global_slice.clone()),
+            total_sheets: target_total_sheets,
+            adapt_target_simplex: true,
             job: target_job,
-            sheet_to_pages: target_sheet_to_pages,
             cancel_token: worker_cancel.clone(),
             master_cancel: self.master_cancel.clone(),
-            event_tx: self.event_tx.clone(),
+            spooling_active: spooling_active.clone(),
+            notifier: self.notifier.clone(),
             custom_spooler: self.custom_spooler.clone(),
         };
 
@@ -516,21 +863,32 @@ impl MultiJobHandle {
             current_sheet: 0,
             total_sheets: target_total_sheets,
             bytes_sent: 0,
-            health: StreamHealth::Healthy { rate_kbps: 0.0, sheets_per_sec: 0.0 },
+            health: StreamHealth::Healthy {
+                rate_kbps: 0.0,
+                sheets_per_sec: 0.0,
+            },
             last_progress_time: Instant::now(),
             ledger: CommittedSheetsLedger::new(target_total_sheets),
             error_message: None,
         };
 
+        self.worker_sheet_map.insert(to_printer.to_string(), global_slice);
+        self.worker_duplex.insert(to_printer.to_string(), target_is_duplex);
         self.telemetry.insert(to_printer.to_string(), initial_tel);
-        self.workers.insert(to_printer.to_string(), WorkerControl { cancel_token: worker_cancel });
+        self.workers.insert(
+            to_printer.to_string(),
+            WorkerControl {
+                cancel_token: worker_cancel,
+                spooling_active,
+            },
+        );
 
-        let builder = std::thread::Builder::new().name(format!("print-worker-failover-{}", to_printer));
-        let _ = builder.spawn(move || {
-            run_printer_worker(task);
-        });
+        let builder = std::thread::Builder::new().name(format!("print-worker-failover-{to_printer}"));
+        if let Err(e) = builder.spawn(move || run_printer_worker(task)) {
+            return Err(FailoverError::LayoutError(to_printer.to_string(), e.to_string()));
+        }
 
-        let _ = self.event_tx.send(CoordinatorEvent::FailoverDispatched {
+        self.notifier.send(CoordinatorEvent::FailoverDispatched {
             from_printer: from_printer.to_string(),
             to_printer: to_printer.to_string(),
             rerouted_sheets: target_total_sheets,
@@ -538,6 +896,24 @@ impl MultiJobHandle {
 
         Ok(())
     }
+}
+
+/// If `job.options` carries a CUPS `orientation-requested` entry from the full document, recompute
+/// it strictly for the sliced failover sheets so mixed-orientation documents stay accurate.
+fn refresh_cups_orientation_for_slice(
+    job: &mut pdfcraft_print::spool::Job,
+    batch_sheets: &[Sheet],
+    slice_indices: &[usize],
+) {
+    if !job.options.iter().any(|(k, _)| k == "orientation-requested") {
+        return;
+    }
+    job.options.retain(|(k, _)| k != "orientation-requested");
+    let sliced: Vec<Sheet> = slice_indices
+        .iter()
+        .filter_map(|&idx| batch_sheets.get(idx).cloned())
+        .collect();
+    pdfcraft_print::add_cups_orientation(&mut job.options, &sliced);
 }
 
 impl Drop for MultiJobHandle {
@@ -551,7 +927,8 @@ pub struct PrintOrchestrationCoordinator;
 
 impl PrintOrchestrationCoordinator {
     /// Dispatches a print job concurrently to multiple target printers using default spooler settings.
-    /// Kept for backward compatibility; production UI workflows call [`Self::dispatch_batch`].
+    /// Kept for backward compatibility; production UI workflows call [`Self::dispatch_batch`] or
+    /// [`Self::dispatch_batch_prepared`].
     pub fn dispatch_multi(
         printers: &[String],
         settings: &Settings,
@@ -567,6 +944,7 @@ impl PrintOrchestrationCoordinator {
             default_job: pdfcraft_print::spool::Job::default(),
             pre_imposed_pdf: None,
             custom_spooler: None,
+            on_event_wakeup: None,
         })
     }
 
@@ -574,41 +952,79 @@ impl PrintOrchestrationCoordinator {
     /// unified hardware ticket settings (`copies`, `collate`, `duplex`, `grayscale`, `paper`, `options`)
     /// and sharing zero-copy PDF buffers across isolated background worker threads.
     pub fn dispatch_batch(config: BatchDispatchConfig) -> Result<MultiJobHandle, PrintCoordinatorError> {
+        Self::dispatch_batch_internal(config, None)
+    }
+
+    /// Dispatches a unified print batch using an O(1) [`PreparedPrintSource`] captured from
+    /// [`crate::Session::prepare_print_pdf`], moving all imposition, rasterization, monochrome
+    /// filtering, and GDI transparency flattening completely off the UI thread.
+    pub fn dispatch_batch_prepared(
+        config: BatchDispatchConfig,
+        prepared: PreparedPrintSource,
+    ) -> Result<MultiJobHandle, PrintCoordinatorError> {
+        Self::dispatch_batch_internal(config, Some(prepared))
+    }
+
+    fn dispatch_batch_internal(
+        config: BatchDispatchConfig,
+        prepared_source: Option<PreparedPrintSource>,
+    ) -> Result<MultiJobHandle, PrintCoordinatorError> {
         if config.printers.is_empty() {
             return Err(PrintCoordinatorError::NoPrintersSelected);
         }
 
-        let sheets = layout(&config.page_sizes, &config.settings)
+        let batch_sheets = layout(&config.page_sizes, &config.settings)
             .map_err(|e| PrintCoordinatorError::Layout(e.to_string()))?;
-        let sheet_to_pages = sheet_pages(&sheets);
-        let total_sheets = sheets.len();
+        let total_sheets = batch_sheets.len();
+
+        let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+        let governor = Arc::new(ConcurrencyGovernor::new(cpus.clamp(1, 4), cpus.clamp(2, 8)));
+
+        let batch_cache = Arc::new(BatchPreparedCache::new(
+            config.doc_source,
+            prepared_source,
+            config.pre_imposed_pdf,
+            config.settings,
+            governor,
+        ));
 
         let (event_tx, event_rx) = channel();
+        let notifier = EventNotifier {
+            tx: event_tx,
+            wakeup: config.on_event_wakeup,
+        };
         let master_cancel = CancellationToken::new();
         let mut workers = HashMap::new();
         let mut telemetry = HashMap::new();
-        let mono_cache: SharedMonoCache = Arc::new(std::sync::OnceLock::new());
+        let mut worker_sheet_map = HashMap::new();
+        let mut worker_duplex = HashMap::new();
+        let full_sheet_indices: Vec<usize> = (0..total_sheets).collect();
 
         for printer_name in &config.printers {
             let worker_cancel = CancellationToken::new();
+            let spooling_active = Arc::new(AtomicBool::new(false));
             let mut job = config
                 .printer_jobs
                 .get(printer_name)
                 .cloned()
                 .unwrap_or_else(|| config.default_job.clone());
             job.printer = Some(printer_name.clone());
+            let is_duplex = matches!(
+                job.duplex,
+                Some(pdfcraft_print::spool::Duplex::LongEdge | pdfcraft_print::spool::Duplex::ShortEdge)
+            );
 
             let task = WorkerTask {
                 printer_name: printer_name.clone(),
-                settings: config.settings.clone(),
-                doc_source: config.doc_source.clone(),
-                pre_imposed_pdf: config.pre_imposed_pdf.clone(),
-                mono_cache: mono_cache.clone(),
+                batch_cache: batch_cache.clone(),
+                slice_sheets: None,
+                total_sheets,
+                adapt_target_simplex: false,
                 job,
-                sheet_to_pages: sheet_to_pages.clone(),
                 cancel_token: worker_cancel.clone(),
                 master_cancel: master_cancel.clone(),
-                event_tx: event_tx.clone(),
+                spooling_active: spooling_active.clone(),
+                notifier: notifier.clone(),
                 custom_spooler: config.custom_spooler.clone(),
             };
 
@@ -617,26 +1033,36 @@ impl PrintOrchestrationCoordinator {
                 current_sheet: 0,
                 total_sheets,
                 bytes_sent: 0,
-                health: StreamHealth::Healthy { rate_kbps: 0.0, sheets_per_sec: 0.0 },
+                health: StreamHealth::Healthy {
+                    rate_kbps: 0.0,
+                    sheets_per_sec: 0.0,
+                },
                 last_progress_time: Instant::now(),
                 ledger: CommittedSheetsLedger::new(total_sheets),
                 error_message: None,
             };
             telemetry.insert(printer_name.clone(), initial_tel);
+            worker_sheet_map.insert(printer_name.clone(), full_sheet_indices.clone());
+            worker_duplex.insert(printer_name.clone(), is_duplex);
 
-            let builder = std::thread::Builder::new().name(format!("print-worker-{}", printer_name));
-            let spawned = builder.spawn(move || {
-                run_printer_worker(task);
-            });
-
-            if let Err(e) = spawned {
-                return Err(PrintCoordinatorError::ThreadSpawn(printer_name.clone(), e.to_string()));
+            let builder = std::thread::Builder::new().name(format!("print-worker-{printer_name}"));
+            if let Err(e) = builder.spawn(move || run_printer_worker(task)) {
+                return Err(PrintCoordinatorError::ThreadSpawn(
+                    printer_name.clone(),
+                    e.to_string(),
+                ));
             }
 
-            workers.insert(printer_name.clone(), WorkerControl { cancel_token: worker_cancel });
+            workers.insert(
+                printer_name.clone(),
+                WorkerControl {
+                    cancel_token: worker_cancel,
+                    spooling_active,
+                },
+            );
         }
 
-        let _ = event_tx.send(CoordinatorEvent::BatchStarted {
+        notifier.send(CoordinatorEvent::BatchStarted {
             total_printers: config.printers.len(),
         });
 
@@ -647,13 +1073,13 @@ impl PrintOrchestrationCoordinator {
             batch_id,
             workers,
             event_rx,
-            event_tx,
+            notifier,
             telemetry,
             master_cancel,
-            doc_source: config.doc_source,
-            original_settings: config.settings,
-            page_sizes: config.page_sizes,
-            sheet_to_pages,
+            batch_cache,
+            batch_sheets,
+            worker_sheet_map,
+            worker_duplex,
             printer_jobs: config.printer_jobs,
             default_job: config.default_job,
             custom_spooler: config.custom_spooler,
@@ -664,135 +1090,163 @@ impl PrintOrchestrationCoordinator {
 /// Self-contained execution bundle for a single isolated printer worker thread.
 struct WorkerTask {
     printer_name: String,
-    settings: Settings,
-    doc_source: SharedPdfSource,
-    pre_imposed_pdf: Option<Arc<Vec<u8>>>,
-    mono_cache: SharedMonoCache,
+    batch_cache: Arc<BatchPreparedCache>,
+    slice_sheets: Option<Vec<usize>>,
+    total_sheets: usize,
+    adapt_target_simplex: bool,
     job: pdfcraft_print::spool::Job,
-    sheet_to_pages: Vec<Vec<usize>>,
     cancel_token: CancellationToken,
     master_cancel: CancellationToken,
-    event_tx: Sender<CoordinatorEvent>,
+    spooling_active: Arc<AtomicBool>,
+    notifier: EventNotifier,
     custom_spooler: Option<SpoolSubmitFn>,
 }
 
-/// Prepares print-ready PDF bytes for one worker, applying Dual-Layer K-Only Monochrome filtering
-/// when `job.grayscale` is enabled while sharing cached output across sibling workers.
-fn prepare_worker_pdf(
-    doc_source: &SharedPdfSource,
-    pre_imposed_pdf: Option<&Arc<Vec<u8>>>,
-    mono_cache: &SharedMonoCache,
-    settings: &Settings,
-    job: &mut pdfcraft_print::spool::Job,
-) -> Result<Vec<u8>, String> {
-    if let Some(pdf_arc) = pre_imposed_pdf {
-        if job.grayscale {
-            let cached = mono_cache.get_or_init(|| {
-                pdfcraft_print::monochrome::MonochromeVectorFilter::filter_document_to_k_only(pdf_arc)
-                    .ok()
-                    .map(Arc::new)
-            });
-            if let Some(mono_arc) = cached {
-                job.grey_pages = true;
-                return Ok(mono_arc.as_ref().clone());
-            }
-        }
-        return Ok(pdf_arc.as_ref().clone());
+impl WorkerTask {
+    fn is_cancelled(&self) -> bool {
+        self.cancel_token.is_cancelled() || self.master_cancel.is_cancelled()
     }
 
-    let doc_arc = match doc_source {
-        #[cfg(not(target_arch = "wasm32"))]
-        SharedPdfSource::Mmap(m) => Arc::new(m.as_ref().to_vec()),
-        SharedPdfSource::Heap(h) => h.clone(),
-    };
-    let cos_doc = pdfcraft_cos::Document::open(doc_arc)
-        .map_err(|e| format!("Failed to open PDF document: {e}"))?;
-    let imposed = pdfcraft_print::impose(&cos_doc, settings)
-        .map_err(|e| format!("Imposition failure: {e}"))?;
+    fn emit_cancelled(&self) {
+        self.spooling_active.store(false, Ordering::Release);
+        self.notifier.send(CoordinatorEvent::PrinterCancelled {
+            printer_name: self.printer_name.clone(),
+        });
+    }
 
-    if job.grayscale
-        && let Ok(mono_bytes) =
-            pdfcraft_print::monochrome::MonochromeVectorFilter::filter_document_to_k_only(&imposed)
+    fn emit_failed(&self, mut ledger: CommittedSheetsLedger, error: String) {
+        self.spooling_active.store(false, Ordering::Release);
+        let failed_idx = ledger.committed_count();
+        ledger.record_failure(failed_idx);
+        self.notifier.send(CoordinatorEvent::PrinterFailed {
+            printer_name: self.printer_name.clone(),
+            error,
+            committed_sheets: ledger.committed_sheets,
+            pending_sheets: ledger.pending_sheets,
+            suggested_failover: None,
+        });
+    }
+}
+
+/// Prepares the zero-copy spool-ready PDF buffer for `task` under CPU governance.
+fn prepare_task_spool_bytes(task: &mut WorkerTask) -> Result<Arc<Vec<u8>>, String> {
+    if task.adapt_target_simplex
+        && task.custom_spooler.is_none()
+        && matches!(
+            task.job.duplex,
+            Some(pdfcraft_print::spool::Duplex::LongEdge | pdfcraft_print::spool::Duplex::ShortEdge)
+        )
+        && pdfcraft_print::spool::two_sided(&task.printer_name) == Some(false)
     {
-        job.grey_pages = true;
-        return Ok(mono_bytes);
+        task.job.duplex = None;
     }
 
-    Ok(imposed)
+    let shared_buffer = task.batch_cache.resolve(&task.cancel_token)?;
+    let is_gdi =
+        task.custom_spooler.is_none() && pdfcraft_print::spool::gdi_driver(&task.printer_name);
+
+    if let Some(ref indices) = task.slice_sheets {
+        let _cpu_permit = task
+            .batch_cache
+            .governor
+            .acquire_cpu_permit(&task.cancel_token)
+            .map_err(governor_err_string)?;
+        return shared_buffer.slice_sheets(indices, &mut task.job, is_gdi);
+    }
+
+    let _cpu_permit = task
+        .batch_cache
+        .governor
+        .acquire_cpu_permit(&task.cancel_token)
+        .map_err(governor_err_string)?;
+    Ok(shared_buffer.for_job(&mut task.job, is_gdi))
 }
 
 /// Background worker executing on an isolated thread.
 fn run_printer_worker(mut task: WorkerTask) {
-    let total_sheets = task.sheet_to_pages.len();
+    let total_sheets = task.total_sheets;
     let mut ledger = CommittedSheetsLedger::new(total_sheets);
     let start_time = Instant::now();
-    let mut last_progress = Instant::now();
 
-    if task.cancel_token.is_cancelled() || task.master_cancel.is_cancelled() {
-        let _ = task.event_tx.send(CoordinatorEvent::PrinterCancelled {
-            printer_name: task.printer_name,
-        });
+    if task.is_cancelled() {
+        task.emit_cancelled();
         return;
     }
 
-    let imposed_bytes = match prepare_worker_pdf(
-        &task.doc_source,
-        task.pre_imposed_pdf.as_ref(),
-        &task.mono_cache,
-        &task.settings,
-        &mut task.job,
-    ) {
+    let spooled_bytes = match prepare_task_spool_bytes(&mut task) {
         Ok(b) => b,
         Err(error) => {
-            ledger.record_failure(0);
-            let _ = task.event_tx.send(CoordinatorEvent::PrinterFailed {
-                printer_name: task.printer_name,
-                error,
-                committed_sheets: ledger.committed_sheets,
-                pending_sheets: ledger.pending_sheets,
-                suggested_failover: None,
-            });
+            if task.is_cancelled() {
+                task.emit_cancelled();
+            } else {
+                task.emit_failed(ledger, error);
+            }
             return;
         }
     };
 
-    let is_gdi = task.custom_spooler.is_none()
-        && pdfcraft_print::spool::gdi_driver(&task.printer_name);
-    let spooled_bytes = crate::spooler::spooler_copy(imposed_bytes, &mut task.job, is_gdi);
+    let _spool_permit = match task
+        .batch_cache
+        .governor
+        .acquire_spool_permit(&task.cancel_token)
+    {
+        Ok(permit) => permit,
+        Err(err) => {
+            if task.is_cancelled() || matches!(err, GovernorError::Cancelled) {
+                task.emit_cancelled();
+            } else {
+                task.emit_failed(ledger, governor_err_string(err));
+            }
+            return;
+        }
+    };
 
-    if task.cancel_token.is_cancelled() || task.master_cancel.is_cancelled() {
-        let _ = task.event_tx.send(CoordinatorEvent::PrinterCancelled {
-            printer_name: task.printer_name,
-        });
+    if task.is_cancelled() {
+        task.emit_cancelled();
         return;
     }
+
+    // Mark active spooling and refresh last_progress_time right as transmission starts so
+    // STALL_TIMEOUT applies strictly to active spooling rather than queue/prep wait time.
+    let mut last_progress = Instant::now();
+    task.spooling_active.store(true, Ordering::Release);
+    task.notifier.send(CoordinatorEvent::ProgressUpdate(PrinterStreamTelemetry {
+        printer_name: task.printer_name.clone(),
+        current_sheet: 0,
+        total_sheets,
+        bytes_sent: 0,
+        health: StreamHealth::Healthy {
+            rate_kbps: 0.0,
+            sheets_per_sec: 0.0,
+        },
+        last_progress_time: last_progress,
+        ledger: ledger.clone(),
+        error_message: None,
+    }));
 
     let total_bytes = spooled_bytes.len() as u64;
     let bytes_per_sheet = total_bytes / (total_sheets.max(1) as u64);
     let printer_for_cb = task.printer_name.clone();
     let cancel_for_cb = task.cancel_token.clone();
     let master_for_cb = task.master_cancel.clone();
-    let tx_for_cb = task.event_tx.clone();
+    let notifier_for_cb = task.notifier.clone();
 
     let mut on_progress = |sent_sheets: usize, total: usize| {
         if cancel_for_cb.is_cancelled() || master_for_cb.is_cancelled() {
             return;
         }
-
         let now = Instant::now();
         let dt = now.duration_since(last_progress).as_secs_f64().max(0.001);
         last_progress = now;
-
         ledger.mark_committed_up_to(sent_sheets);
 
         let sheets_per_sec = if dt > 0.0 { 1.0 / dt } else { 0.0 };
         let bytes_sent = (sent_sheets as u64) * bytes_per_sheet;
         let rate_kbps = (bytes_per_sheet as f64 / 1024.0) / dt;
-
         let health = if rate_kbps > 0.0 && rate_kbps < THROTTLE_THRESHOLD_KBPS {
             StreamHealth::Throttled {
                 rate_kbps,
-                reason: format!("Transfer rate ({:.1} KB/s) below threshold", rate_kbps),
+                reason: format!("Transfer rate ({rate_kbps:.1} KB/s) below threshold"),
             }
         } else {
             StreamHealth::Healthy {
@@ -801,7 +1255,7 @@ fn run_printer_worker(mut task: WorkerTask) {
             }
         };
 
-        let telemetry = PrinterStreamTelemetry {
+        notifier_for_cb.send(CoordinatorEvent::ProgressUpdate(PrinterStreamTelemetry {
             printer_name: printer_for_cb.clone(),
             current_sheet: sent_sheets,
             total_sheets: total,
@@ -810,9 +1264,7 @@ fn run_printer_worker(mut task: WorkerTask) {
             last_progress_time: now,
             ledger: ledger.clone(),
             error_message: None,
-        };
-
-        let _ = tx_for_cb.send(CoordinatorEvent::ProgressUpdate(telemetry));
+        }));
     };
 
     let submit_res = match &task.custom_spooler {
@@ -820,28 +1272,24 @@ fn run_printer_worker(mut task: WorkerTask) {
         None => pdfcraft_print::spool::submit_with_progress(&spooled_bytes, &task.job, &mut on_progress)
             .map_err(|e| e.to_string()),
     };
+    task.spooling_active.store(false, Ordering::Release);
 
-    let duration_secs = start_time.elapsed().as_secs_f64();
+    if task.is_cancelled() {
+        task.emit_cancelled();
+        return;
+    }
 
     match submit_res {
         Ok(_) => {
             ledger.mark_committed_up_to(total_sheets);
-            let _ = task.event_tx.send(CoordinatorEvent::PrinterCompleted {
+            task.notifier.send(CoordinatorEvent::PrinterCompleted {
                 printer_name: task.printer_name,
                 total_sheets,
-                duration_secs,
+                duration_secs: start_time.elapsed().as_secs_f64(),
             });
         }
         Err(error) => {
-            let failed_idx = ledger.committed_count();
-            ledger.record_failure(failed_idx);
-            let _ = task.event_tx.send(CoordinatorEvent::PrinterFailed {
-                printer_name: task.printer_name,
-                error,
-                committed_sheets: ledger.committed_sheets,
-                pending_sheets: ledger.pending_sheets,
-                suggested_failover: None,
-            });
+            task.emit_failed(ledger, error);
         }
     }
 }
@@ -1021,6 +1469,9 @@ mod tests {
         printer_jobs.insert("Canon_MFP".to_string(), base_job.clone());
         printer_jobs.insert("Brother_Simplex".to_string(), simplex_job);
 
+        let wakeups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wakeups_cb = wakeups.clone();
+
         let mut handle = PrintOrchestrationCoordinator::dispatch_batch(BatchDispatchConfig {
             printers: vec![
                 "HP_Laser".to_string(),
@@ -1034,6 +1485,9 @@ mod tests {
             default_job: base_job,
             pre_imposed_pdf: Some(Arc::new(imposed)),
             custom_spooler: Some(spooler),
+            on_event_wakeup: Some(Arc::new(move || {
+                wakeups_cb.fetch_add(1, Ordering::Relaxed);
+            })),
         })
         .unwrap();
 
@@ -1043,6 +1497,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(handle.is_all_completed());
+        assert!(
+            wakeups.load(Ordering::Relaxed) >= 4,
+            "on_event_wakeup must fire on batch start, progress, and completion"
+        );
 
         let records = captured.lock().unwrap();
         assert_eq!(records.len(), 3);
@@ -1117,6 +1575,7 @@ mod tests {
             default_job,
             pre_imposed_pdf: None,
             custom_spooler: Some(spooler),
+            on_event_wakeup: None,
         })
         .unwrap();
 

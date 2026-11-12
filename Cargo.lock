@@ -1225,7 +1225,7 @@ dependencies = [
  "miniz_oxide 0.9.1",
  "roxmltree 0.21.2",
  "tempfile",
- "winprint 0.2.1 (git+https://github.com/storytold/winprint.rs?rev=bc06a7c48b768eb27a828c7986f6d2868b245ee0)",
+ "winprint",
  "winsafe",
 ]
 
@@ -4480,9 +4480,11 @@ dependencies = [
  "pdfcraft-filters",
  "pdfcraft-model",
  "pdfcraft-render",
+ "roxmltree 0.21.2",
  "skrifa 0.44.0",
+ "tempfile",
  "thiserror 2.0.21",
- "winprint 0.2.1 (git+https://github.com/storytold/winprint.rs?rev=5f80b9baf6b58937c401656634e42d33f00ddf49)",
+ "winprint",
 ]
 
 [[package]]
@@ -7617,21 +7619,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "winprint"
-version = "0.2.1"
-source = "git+https://github.com/storytold/winprint.rs?rev=5f80b9baf6b58937c401656634e42d33f00ddf49#5f80b9baf6b58937c401656634e42d33f00ddf49"
-dependencies = [
- "fmt-derive",
- "scopeguard",
- "strum",
- "thiserror 2.0.21",
- "windows",
- "windows-core",
- "windows-implement",
- "xml",
 ]
 
 [[package]]
