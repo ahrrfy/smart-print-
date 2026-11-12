@@ -19,6 +19,11 @@ pub type UpdateSource = CheckSource;
 pub(crate) struct Updates {
     #[cfg(not(target_arch = "wasm32"))]
     updater: Updater,
+    /// Enterprise Dual-Mode Update Channel (official `storytold/pdfcraft` + custom merged portable
+    /// releases / automatic local `sync-upstream.ps1` rebuild). Enabled by the desktop binary so
+    /// unit tests keep exercising `craft_update::Updater` in isolation.
+    #[cfg(not(target_arch = "wasm32"))]
+    enterprise: Option<super::custom_update::EnterpriseUpdater>,
     /// The Updates dialog is showing.
     pub(crate) open: bool,
     /// Ask for a newer release at start, unless Preferences says not to; the desktop app turns
@@ -42,6 +47,9 @@ impl Updates {
     pub(crate) fn prompt_open(&self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         {
+            if let Some(ent) = &self.enterprise {
+                return ent.prompt_open();
+            }
             self.updater.prompt_open()
         }
         #[cfg(target_arch = "wasm32")]
@@ -56,6 +64,8 @@ impl Default for Updates {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             updater: Updater::new(&crate::UPDATE_APP, env!("CARGO_PKG_VERSION")),
+            #[cfg(not(target_arch = "wasm32"))]
+            enterprise: None,
             open: false,
             #[cfg(not(target_arch = "wasm32"))]
             startup_check: false,
@@ -73,7 +83,13 @@ impl Updates {
     /// Starts the helper of an update that waits for the app to exit. Later calls do nothing.
     pub(crate) fn exiting(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
-        self.updater.start_pending_update();
+        {
+            if let Some(ent) = &mut self.enterprise {
+                ent.start_pending_update();
+            } else {
+                self.updater.start_pending_update();
+            }
+        }
         #[cfg(test)]
         {
             self.exits += 1;
@@ -88,13 +104,20 @@ impl Updates {
         if can_start && std::mem::take(&mut self.close_queued) {
             return Action::Close;
         }
+        if let Some(ent) = &mut self.enterprise {
+            return ent.show_if(ctx, can_start);
+        }
         self.updater.show_if(ctx, can_start)
     }
 
     /// Asks the next frame that may close to close the app, so that a ready update installs.
     #[cfg(not(target_arch = "wasm32"))]
     fn queue_close(&mut self) {
-        self.updater.restart_to_update();
+        if let Some(ent) = &mut self.enterprise {
+            ent.restart_to_update();
+        } else {
+            self.updater.restart_to_update();
+        }
         #[cfg(test)]
         {
             self.close_queued = true;
@@ -107,6 +130,24 @@ impl Updates {
     fn take_queued_close(&mut self, ctx: &egui::Context) {
         let _ = self.show_prompt(ctx, true);
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn active_status(&self) -> &Status {
+        if let Some(ent) = &self.enterprise {
+            ent.status()
+        } else {
+            self.updater.status()
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn dismiss_active_status(&mut self) {
+        if let Some(ent) = &mut self.enterprise {
+            ent.dismiss_status();
+        } else {
+            self.updater.dismiss_status();
+        }
+    }
 }
 
 impl PdfCraftApp {
@@ -116,9 +157,19 @@ impl PdfCraftApp {
         self.updates.startup_check = on;
     }
 
+    /// Activates the Enterprise Dual-Mode Update Channel (monitors official `storytold/pdfcraft`
+    /// releases + optional `custom_repo` merged portable builds, never wiping Multi-Printer features).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn enable_enterprise_update_channel(&mut self) {
+        self.updates.enterprise = Some(super::custom_update::EnterpriseUpdater::new(env!(
+            "CARGO_PKG_VERSION"
+        )));
+    }
+
     /// Replaces the network with `source` (tests).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn set_update_source(&mut self, source: UpdateSource) {
+        self.updates.enterprise = None;
         self.updates.updater = Updater::new(&crate::UPDATE_APP, env!("CARGO_PKG_VERSION")).with_source(source);
     }
 
@@ -143,12 +194,21 @@ impl PdfCraftApp {
             // Settled on the first frame: a preference turned on later waits for the next start.
             let at_start = std::mem::take(&mut self.updates.startup_check) && self.update_check_at_start;
             let updates = &mut self.updates;
-            if std::mem::take(&mut updates.check_requested) {
-                updates.updater.check_now(&ctx);
-            } else if at_start {
-                updates.updater.check_at_start(&ctx);
+            if let Some(ent) = &mut updates.enterprise {
+                if std::mem::take(&mut updates.check_requested) {
+                    ent.check_now(&ctx);
+                } else if at_start {
+                    ent.check_at_start(&ctx);
+                }
+                ent.tick(&ctx);
+            } else {
+                if std::mem::take(&mut updates.check_requested) {
+                    updates.updater.check_now(&ctx);
+                } else if at_start {
+                    updates.updater.check_at_start(&ctx);
+                }
+                updates.updater.tick(&ctx);
             }
-            updates.updater.tick(&ctx);
         }
     }
 }
@@ -167,12 +227,12 @@ pub(crate) fn dialog(app: &mut PdfCraftApp, ctx: &egui::Context) {
             }
         }
         // A requested check that found a release is answered by the prompt, not by this dialog.
-        if app.updates.open && !app.updates.check_requested && matches!(app.updates.updater.status(), Status::Idle) {
+        if app.updates.open && !app.updates.check_requested && matches!(app.updates.active_status(), Status::Idle) {
             app.updates.open = false;
         }
         if app.updates.open {
             let dialog = CheckResultDialog::new(&crate::UPDATE_APP, env!("CARGO_PKG_VERSION"));
-            let response = dialog.show(ctx, app.updates.updater.status());
+            let response = dialog.show(ctx, app.updates.active_status());
             answer_result(app, ctx, response);
         }
     }
@@ -187,7 +247,7 @@ fn answer_result(app: &mut PdfCraftApp, ctx: &egui::Context, response: CheckResu
         CheckResultResponse::None => {}
         CheckResultResponse::Close => {
             app.updates.open = false;
-            app.updates.updater.dismiss_status();
+            app.updates.dismiss_active_status();
         }
         CheckResultResponse::CheckAgain => app.updates.check_requested = true,
         CheckResultResponse::RestartToUpdate => restart_to_update(app, ctx),
@@ -204,8 +264,8 @@ fn restart_to_update(app: &mut PdfCraftApp, ctx: &egui::Context) {
         return;
     }
     app.updates.open = false;
-    app.updates.updater.dismiss_status();
-    if app.updates.updater.prompt_open() {
+    app.updates.dismiss_active_status();
+    if app.updates.prompt_open() {
         return;
     }
     app.updates.take_queued_close(ctx);

@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+pub mod custom_update;
 pub(super) mod drag_pointer;
 pub(super) mod file_filter;
 #[cfg(not(target_arch = "wasm32"))]

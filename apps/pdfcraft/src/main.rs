@@ -201,10 +201,16 @@ fn rejoin_split_paths(args: Vec<String>, exists: impl Fn(&str) -> bool) -> Vec<S
 }
 
 fn main() -> eframe::Result {
-    // Windows: the update helper is a copy of this program started with `--finish-update`.
+    // Windows: the update helper is a copy of this program started with `--finish-update` or `--finish-custom-update`.
     #[cfg(windows)]
-    if let Some(result) = craft_update::self_update::finish(&pdfcraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>()) {
-        std::process::exit(i32::from(result.is_err()));
+    {
+        let raw_args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        if let Some(result) = pdfcraft_ui_egui::custom_update::finish_custom_update(&raw_args) {
+            std::process::exit(i32::from(result.is_err()));
+        }
+        if let Some(result) = craft_update::self_update::finish(&pdfcraft_ui_egui::UPDATE_APP, &raw_args) {
+            std::process::exit(i32::from(result.is_err()));
+        }
     }
     // First, so the panic hook and every start-up warning are recorded (`logging`).
     let logger = logging::install();
@@ -473,6 +479,7 @@ fn app_creator<'a>(
             }
             app.motion.source = Some(motion::source());
         }
+        app.enable_enterprise_update_channel();
         app.set_startup_update_check(true);
         app.printer_source = Some(pdfcraft_ui_egui::system_printers());
         app.two_sided_source = Some(pdfcraft_ui_egui::system_two_sided());

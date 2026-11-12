@@ -162,6 +162,8 @@ pub use platform::portable;
 #[cfg(not(target_arch = "wasm32"))]
 use platform::system_fonts;
 pub use platform::ui_scale;
+#[cfg(not(target_arch = "wasm32"))]
+pub use platform::custom_update;
 pub use platform::updates;
 pub use platform::window_controls;
 #[cfg(test)]

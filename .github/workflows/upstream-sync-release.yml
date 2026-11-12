@@ -1,0 +1,131 @@
+name: Sync Upstream & Publish Custom Release
+
+on:
+  schedule:
+    # Automatically check official storytold/pdfcraft upstream channel every 6 hours
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream tag or branch to sync (default: latest release tag + upstream/main)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync-and-release:
+    name: Merge Upstream PdfCraft + Build Multi-Printer Portable Release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Custom Enterprise Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch Official Upstream (storytold/pdfcraft)
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/storytold/pdfcraft.git
+          git fetch upstream --tags --prune
+
+          $Requested = "${{ inputs.upstream_ref }}"
+          if (![string]::IsNullOrWhiteSpace($Requested)) {
+            $TargetTag = $Requested
+          } else {
+            $LatestRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/storytold/pdfcraft/releases/latest"
+            $TargetTag = $LatestRelease.tag_name
+          }
+          Write-Host "Latest official upstream release tag: $TargetTag"
+          "TARGET_TAG=$TargetTag" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          # Check if a release for this tag already exists on our fork
+          $ExistingRelease = gh release view $TargetTag --json tagName 2>$null
+          $TargetInHead = $false
+          git merge-base --is-ancestor $TargetTag HEAD
+          if ($LASTEXITCODE -eq 0) { $TargetInHead = $true }
+
+          if ($ExistingRelease -and $TargetInHead -and [string]::IsNullOrWhiteSpace($Requested)) {
+            Write-Host "Release $TargetTag is already merged and published on this repository."
+            "SKIP_BUILD=true" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            "SKIP_BUILD=false" | Out-File -FilePath $env:GITHUB_ENV -Append
+            if (-not $TargetInHead) {
+              git merge $TargetTag --no-edit -m "chore(sync): merge official upstream $TargetTag into Enterprise Multi-Printer Edition"
+              git push origin HEAD:main
+            }
+          }
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust 1.95 Toolchain
+        if: env.SKIP_BUILD != 'true'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - name: Rust Cargo Cache
+        if: env.SKIP_BUILD != 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify Architecture Layers & Multi-Printer Suite
+        if: env.SKIP_BUILD != 'true'
+        shell: pwsh
+        run: |
+          cargo run -p xtask -- layers
+          cargo test -p pdfcraft-print --lib
+          cargo test -p pdfcraft-platform --lib
+          cargo test -p pdfcraft-engine --test print_coordinator_tests
+
+      - name: Build Combined Portable Release (Upstream + Multi-Printer)
+        if: env.SKIP_BUILD != 'true'
+        shell: pwsh
+        run: |
+          cargo build --release -p pdfcraft --bin pdfcraft
+          $Ver = cargo pkgid -p pdfcraft | ForEach-Object { ($_ -split '[#@]')[-1] }
+          $AssetStem = "pdfcraft-$Ver-windows-x64-portable"
+          $PackRoot = Join-Path $env:RUNNER_TEMP $AssetStem
+          New-Item -ItemType Directory -Path $PackRoot -Force | Out-Null
+
+          Copy-Item "target\release\pdfcraft.exe" -Destination (Join-Path $PackRoot "pdfcraft.exe") -Force
+          Set-Content -Path (Join-Path $PackRoot "portable.txt") -Value "Portable mode marker - settings stored in PdfCraftData" -Encoding UTF8
+
+          $ChannelJson = @{
+            upstream_repo = "storytold/pdfcraft"
+            custom_repo   = "${{ github.repository }}"
+          } | ConvertTo-Json -Depth 3
+          Set-Content -Path (Join-Path $PackRoot "update_channel.json") -Value $ChannelJson -Encoding UTF8
+
+          $ZipName = "$AssetStem.zip"
+          $ZipPath = Join-Path $env:RUNNER_TEMP $ZipName
+          Compress-Archive -Path $PackRoot -DestinationPath $ZipPath -Force
+
+          $Sha = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $SumsPath = Join-Path $env:RUNNER_TEMP "SHA256SUMS.txt"
+          Set-Content -Path $SumsPath -Value "$Sha  $ZipName" -Encoding ASCII
+
+          "ZIP_PATH=$ZipPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SUMS_PATH=$SumsPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RELEASE_VER=$Ver" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Publish Combined GitHub Release
+        if: env.SKIP_BUILD != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $Tag = $env:TARGET_TAG
+          $Notes = "Merged official upstream `storytold/pdfcraft` **$Tag** with **Enterprise Multi-Printer Cluster Engine** (simultaneous multi-printer dispatch, true K-only monochrome, hardware margin auto-fit, pre-flight capability checks, zero-copy `SharedPdfSource`, failover rerouting, and diagnostic telemetry).`n`nUpstream changelog: https://github.com/storytold/pdfcraft/releases/tag/$Tag"
+          $Exists = gh release view $Tag --json tagName 2>$null
+          if ($Exists) {
+            gh release upload $Tag "$env:ZIP_PATH" "$env:SUMS_PATH" --clobber
+          } else {
+            gh release create $Tag "$env:ZIP_PATH" "$env:SUMS_PATH" --title "PdfCraft $env:RELEASE_VER (Enterprise Multi-Printer)" --notes "$Notes"
+          }
