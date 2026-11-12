@@ -35,17 +35,20 @@ pub const CONFIG_FILE_NAME: &str = "update_channel.json";
 /// Default official PdfCraft upstream repository.
 pub const DEFAULT_UPSTREAM_REPO: &str = "storytold/pdfcraft";
 
+/// Default custom Enterprise Multi-Printer repository publishing pre-merged portable releases.
+pub const DEFAULT_CUSTOM_REPO: &str = "ahrrfy/smart-print-";
+
 /// Configuration governing where updates are checked and how merged binaries are obtained.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpdateChannelConfig {
     /// Official upstream repository (`storytold/pdfcraft`) monitored for new releases.
     #[serde(default = "default_upstream_repo")]
     pub upstream_repo: String,
-    /// Optional GitHub fork (`owner/repo`) publishing pre-merged portable ZIPs + `SHA256SUMS.txt`.
-    #[serde(default)]
+    /// GitHub repository (`owner/repo`) publishing pre-merged portable ZIPs + `SHA256SUMS.txt`.
+    #[serde(default = "default_custom_repo")]
     pub custom_repo: String,
     /// Optional local workspace path containing `scripts/sync-upstream.ps1` for automatic local
-    /// upstream merge + rebuild when `custom_repo` is not configured.
+    /// upstream merge + rebuild when `custom_repo` has not published the tag yet.
     #[serde(default)]
     pub source_workspace: String,
 }
@@ -54,11 +57,15 @@ fn default_upstream_repo() -> String {
     DEFAULT_UPSTREAM_REPO.to_owned()
 }
 
+fn default_custom_repo() -> String {
+    DEFAULT_CUSTOM_REPO.to_owned()
+}
+
 impl Default for UpdateChannelConfig {
     fn default() -> Self {
         Self {
             upstream_repo: default_upstream_repo(),
-            custom_repo: String::new(),
+            custom_repo: default_custom_repo(),
             source_workspace: String::new(),
         }
     }
@@ -540,11 +547,60 @@ impl Drop for EnterpriseUpdater {
     }
 }
 
+/// Discovers an optional GitHub token from environment variables or an authenticated `gh` CLI
+/// session so private `custom_repo` repositories work seamlessly alongside public ones.
+fn discover_github_token() -> Option<String> {
+    for var in ["PDFCRAFT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(val) = std::env::var(var) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_owned());
+            }
+        }
+    }
+    let gh = locate_gh_cli()?;
+    let mut cmd = std::process::Command::new(gh);
+    cmd.args(["auth", "token"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let tok = String::from_utf8(out.stdout).ok()?;
+    let trimmed = tok.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn locate_gh_cli() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let std_path = Path::new(r"C:\Program Files\GitHub CLI\gh.exe");
+        if std_path.is_file() {
+            return Some(std_path.to_path_buf());
+        }
+        Some(PathBuf::from("gh.exe"))
+    }
+    #[cfg(not(windows))]
+    {
+        Some(PathBuf::from("gh"))
+    }
+}
+
+fn new_update_http() -> Result<Http, String> {
+    Ok(Http::new(&format!("{}/Update", crate::UPDATE_APP.name))?
+        .with_github_token(discover_github_token()))
+}
+
 /// Checks `custom_repo` first (if configured), then checks the official upstream channel
 /// (`storytold/pdfcraft`) so upstream releases are always received promptly.
 fn query_channels(running_version: &str) -> CheckOutcome {
     let cfg = UpdateChannelConfig::load();
-    let http = Http::new(&format!("{}/Update", crate::UPDATE_APP.name))?;
+    let http = new_update_http()?;
     let running_parsed = craft_update::parse_version(running_version);
 
     if is_valid_github_repo(&cfg.custom_repo) {
@@ -617,7 +673,7 @@ fn prepare_merged_update(
     } else if is_valid_github_repo(&cfg.custom_repo) {
         // An upstream release was announced before `custom_repo` finished building it; check if
         // `custom_repo` now has the matching release asset ready.
-        let http = Http::new(&format!("{}/Update", crate::UPDATE_APP.name))?;
+        let http = new_update_http()?;
         let running = craft_update::parse_version("0.0.0");
         if let Ok(Some(custom_rel)) = check_repo_releases(&http, &cfg.custom_repo, running.as_ref())
             && custom_rel.tag == release.tag
@@ -654,7 +710,11 @@ fn download_verified_custom_zip(paths: &Paths, release: &Release) -> Result<Path
         )
     })?;
 
-    let http = Http::new(&format!("{}/Update", crate::UPDATE_APP.name))?;
+    let downloads_dir = paths.downloads();
+    std::fs::create_dir_all(&downloads_dir)
+        .map_err(|e| format!("couldn't create downloads folder ({e})"))?;
+
+    let http = new_update_http()?;
     let sha = match &asset.sha256 {
         Some(digest) => digest.clone(),
         None => {
@@ -664,9 +724,11 @@ fn download_verified_custom_zip(paths: &Paths, release: &Release) -> Result<Path
                     release.tag, asset.name
                 )
             })?;
-            let sums_text = http
-                .get_text(&sums_asset.url)?
-                .ok_or("SHA256SUMS.txt was not found on the release")?;
+            let sums_text = match http.get_text(&sums_asset.url) {
+                Ok(Some(text)) => text,
+                _ => gh_fetch_sums_text(&release.repo, &release.tag, &downloads_dir)
+                    .ok_or("SHA256SUMS.txt was not found on the release")?,
+            };
             parse_sha256sums(&sums_text)
                 .into_iter()
                 .find(|(_, name)| name == &asset.name)
@@ -675,12 +737,59 @@ fn download_verified_custom_zip(paths: &Paths, release: &Release) -> Result<Path
         }
     };
 
-    let downloads_dir = paths.downloads();
-    std::fs::create_dir_all(&downloads_dir)
-        .map_err(|e| format!("couldn't create downloads folder ({e})"))?;
     let dest = downloads_dir.join(&asset.name);
-    http.download(&asset.url, &dest, asset.size, &sha, &Stop::default(), &mut |_| {})?;
+    if let Err(err) = http.download(&asset.url, &dest, asset.size, &sha, &Stop::default(), &mut |_| {}) {
+        // Private GitHub repositories return 404 on unauthenticated browser_download_url requests;
+        // attempt an authenticated `gh release download` and then re-verify SHA-256 via `http.download`.
+        if gh_download_release_asset(&release.repo, &release.tag, &asset.name, &downloads_dir) {
+            http.download(&asset.url, &dest, asset.size, &sha, &Stop::default(), &mut |_| {})?;
+        } else {
+            return Err(err);
+        }
+    }
     Ok(dest)
+}
+
+fn gh_download_release_asset(repo: &str, tag: &str, asset_name: &str, dir: &Path) -> bool {
+    if !is_valid_github_repo(repo)
+        || !craft_update::release::valid_tag(tag)
+        || !craft_update::release::valid_file_name(asset_name)
+    {
+        return false;
+    }
+    let Some(gh) = locate_gh_cli() else {
+        return false;
+    };
+    let mut cmd = std::process::Command::new(gh);
+    cmd.args([
+        "release",
+        "download",
+        tag,
+        "--repo",
+        repo,
+        "--pattern",
+        asset_name,
+        "--clobber",
+        "--dir",
+    ])
+    .arg(dir);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.status().is_ok_and(|s| s.success())
+}
+
+fn gh_fetch_sums_text(repo: &str, tag: &str, dir: &Path) -> Option<String> {
+    if !gh_download_release_asset(repo, tag, "SHA256SUMS.txt", dir) {
+        return None;
+    }
+    let sums_path = dir.join("SHA256SUMS.txt");
+    let text = std::fs::read_to_string(&sums_path).ok();
+    let _ = std::fs::remove_file(&sums_path);
+    text
 }
 
 fn build_merged_upstream_zip(
@@ -853,7 +962,10 @@ mod tests {
     #[test]
     fn github_repo_validation_rejects_traversal_and_metacharacters() {
         assert!(is_valid_github_repo("storytold/pdfcraft"));
+        assert!(is_valid_github_repo(DEFAULT_CUSTOM_REPO));
         assert!(is_valid_github_repo("my-org_1/pdfcraft.enterprise"));
+        assert_eq!(UpdateChannelConfig::default().custom_repo, DEFAULT_CUSTOM_REPO);
+        assert!(UpdateChannelConfig::default().can_install_merged_update());
         assert!(!is_valid_github_repo(""));
         assert!(!is_valid_github_repo("storytold"));
         assert!(!is_valid_github_repo("storytold/pdfcraft/extra"));

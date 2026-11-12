@@ -7,9 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: "Upstream tag or branch to sync (default: latest release tag + upstream/main)"
+        description: "Upstream tag or branch to sync (default: latest release tag)"
         required: false
         default: ""
+      force_rebuild:
+        description: "Rebuild and re-upload release assets even if tag is already published"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -19,16 +24,57 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  check-upstream:
+    name: Check Official Upstream Release (storytold/pdfcraft)
+    runs-on: ubuntu-latest
+    outputs:
+      target_tag: ${{ steps.probe.outputs.target_tag }}
+      needs_build: ${{ steps.probe.outputs.needs_build }}
+    steps:
+      - name: Compare Upstream Release Against Custom Repository
+        id: probe
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED_REF: ${{ inputs.upstream_ref }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${REQUESTED_REF}" ]]; then
+            TARGET_TAG="${REQUESTED_REF}"
+          else
+            TARGET_TAG="$(gh api repos/storytold/pdfcraft/releases/latest --jq '.tag_name')"
+          fi
+          echo "Latest official upstream release tag: ${TARGET_TAG}"
+          echo "target_tag=${TARGET_TAG}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${FORCE_REBUILD}" == "true" ]]; then
+            echo "needs_build=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if gh release view "${TARGET_TAG}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' 2>/dev/null | grep -q -- '-windows-x64-portable\.zip$'; then
+            echo "Release ${TARGET_TAG} is already published on ${GITHUB_REPOSITORY}. Skipping Windows build."
+            echo "needs_build=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "New upstream release ${TARGET_TAG} requires merge & Windows build."
+            echo "needs_build=true" >> "${GITHUB_OUTPUT}"
+          fi
+
   sync-and-release:
-    name: Merge Upstream PdfCraft + Build Multi-Printer Portable Release
+    name: Merge Upstream PdfCraft + Build Full Portable Package
+    needs: check-upstream
+    if: needs.check-upstream.outputs.needs_build == 'true'
     runs-on: windows-latest
+    env:
+      TARGET_TAG: ${{ needs.check-upstream.outputs.target_tag }}
     steps:
       - name: Checkout Custom Enterprise Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Fetch Official Upstream (storytold/pdfcraft)
+      - name: Merge Official Upstream Tag (storytold/pdfcraft)
         shell: pwsh
         run: |
           git config user.name "github-actions[bot]"
@@ -36,96 +82,112 @@ jobs:
           git remote add upstream https://github.com/storytold/pdfcraft.git
           git fetch upstream --tags --prune
 
-          $Requested = "${{ inputs.upstream_ref }}"
-          if (![string]::IsNullOrWhiteSpace($Requested)) {
-            $TargetTag = $Requested
-          } else {
-            $LatestRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/storytold/pdfcraft/releases/latest"
-            $TargetTag = $LatestRelease.tag_name
+          git merge-base --is-ancestor "$env:TARGET_TAG" HEAD
+          if ($LASTEXITCODE -ne 0) {
+            git merge "$env:TARGET_TAG" --no-edit -m "chore(sync): merge official upstream $env:TARGET_TAG into Enterprise Multi-Printer Edition"
+            git push origin HEAD:main
           }
-          Write-Host "Latest official upstream release tag: $TargetTag"
-          "TARGET_TAG=$TargetTag" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-          # Check if a release for this tag already exists on our fork
-          $ExistingRelease = gh release view $TargetTag --json tagName 2>$null
-          $TargetInHead = $false
-          git merge-base --is-ancestor $TargetTag HEAD
-          if ($LASTEXITCODE -eq 0) { $TargetInHead = $true }
-
-          if ($ExistingRelease -and $TargetInHead -and [string]::IsNullOrWhiteSpace($Requested)) {
-            Write-Host "Release $TargetTag is already merged and published on this repository."
-            "SKIP_BUILD=true" | Out-File -FilePath $env:GITHUB_ENV -Append
-          } else {
-            "SKIP_BUILD=false" | Out-File -FilePath $env:GITHUB_ENV -Append
-            if (-not $TargetInHead) {
-              git merge $TargetTag --no-edit -m "chore(sync): merge official upstream $TargetTag into Enterprise Multi-Printer Edition"
-              git push origin HEAD:main
-            }
-          }
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git push origin "HEAD:refs/tags/$env:TARGET_TAG" --force
 
       - name: Install Rust 1.95 Toolchain
-        if: env.SKIP_BUILD != 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95.0"
 
       - name: Rust Cargo Cache
-        if: env.SKIP_BUILD != 'true'
         uses: Swatinem/rust-cache@v2
 
       - name: Verify Architecture Layers & Multi-Printer Suite
-        if: env.SKIP_BUILD != 'true'
         shell: pwsh
         run: |
           cargo run -p xtask -- layers
           cargo test -p pdfcraft-print --lib
           cargo test -p pdfcraft-platform --lib
           cargo test -p pdfcraft-engine --test print_coordinator_tests
+          cargo test -p pdfcraft-ui-egui --lib platform::custom_update
 
-      - name: Build Combined Portable Release (Upstream + Multi-Printer)
-        if: env.SKIP_BUILD != 'true'
+      - name: Build Full Portable Package (GUI + CLI + OCR Models + Channel Config)
         shell: pwsh
         run: |
-          cargo build --release -p pdfcraft --bin pdfcraft
-          $Ver = cargo pkgid -p pdfcraft | ForEach-Object { ($_ -split '[#@]')[-1] }
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static"
+          $env:PDFCRAFT_REQUIRE_WINRES = "1"
+          cargo build --release -p pdfcraft -p pdfcraft-cli --target x86_64-pc-windows-msvc
+
+          $Ver = (cargo pkgid -p pdfcraft | ForEach-Object { ($_ -split '[#@]')[-1] }).Trim()
           $AssetStem = "pdfcraft-$Ver-windows-x64-portable"
           $PackRoot = Join-Path $env:RUNNER_TEMP $AssetStem
           New-Item -ItemType Directory -Path $PackRoot -Force | Out-Null
 
-          Copy-Item "target\release\pdfcraft.exe" -Destination (Join-Path $PackRoot "pdfcraft.exe") -Force
-          Set-Content -Path (Join-Path $PackRoot "portable.txt") -Value "Portable mode marker - settings stored in PdfCraftData" -Encoding UTF8
+          $BinDir = "target\x86_64-pc-windows-msvc\release"
+          Copy-Item "$BinDir\pdfcraft.exe", "$BinDir\pdfcraft-cli.exe" -Destination $PackRoot -Force
 
-          $ChannelJson = @{
+          $ModelsDir = Join-Path $PackRoot "models"
+          New-Item -ItemType Directory -Path $ModelsDir -Force | Out-Null
+          cargo run -p xtask -- models $ModelsDir
+          Remove-Item -Force (Join-Path $ModelsDir "*.part") -ErrorAction SilentlyContinue
+
+          Copy-Item "packaging\windows\portable.txt" -Destination (Join-Path $PackRoot "portable.txt") -Force
+          if (Test-Path "docs\PORTABLE-README-AR.txt") {
+            Copy-Item "docs\PORTABLE-README-AR.txt" -Destination (Join-Path $PackRoot "README-AR.txt") -Force
+          }
+          foreach ($f in @("README.md", "NOTICE", "LICENSE-MIT", "LICENSE-APACHE")) {
+            if (Test-Path $f) { Copy-Item $f -Destination $PackRoot -Force }
+          }
+          if (Test-Path "assets\app-icon\LICENSE-document.txt") {
+            Copy-Item "assets\app-icon\LICENSE-document.txt" -Destination (Join-Path $PackRoot "LICENSE-document.txt") -Force
+          }
+
+          $ChannelJson = [ordered]@{
             upstream_repo = "storytold/pdfcraft"
             custom_repo   = "${{ github.repository }}"
           } | ConvertTo-Json -Depth 3
           Set-Content -Path (Join-Path $PackRoot "update_channel.json") -Value $ChannelJson -Encoding UTF8
 
+          Add-Type -AssemblyName System.IO.Compression
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
           $ZipName = "$AssetStem.zip"
           $ZipPath = Join-Path $env:RUNNER_TEMP $ZipName
-          Compress-Archive -Path $PackRoot -DestinationPath $ZipPath -Force
+          $AliasZipPath = Join-Path $env:RUNNER_TEMP "PdfCraft-Portable.zip"
+
+          $ResolvedRoot = (Resolve-Path $PackRoot).Path.TrimEnd('\', '/')
+          $Fs = [System.IO.File]::Open($ZipPath, [System.IO.FileMode]::CreateNew)
+          try {
+            $Archive = New-Object System.IO.Compression.ZipArchive($Fs, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+            try {
+              foreach ($File in (Get-ChildItem -LiteralPath $ResolvedRoot -Recurse -File)) {
+                $Rel = $File.FullName.Substring($ResolvedRoot.Length).TrimStart('\', '/') -replace '\\', '/'
+                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                  $Archive,
+                  $File.FullName,
+                  "$AssetStem/$Rel",
+                  [System.IO.Compression.CompressionLevel]::Optimal
+                ) | Out-Null
+              }
+            } finally { $Archive.Dispose() }
+          } finally { $Fs.Dispose() }
+
+          Copy-Item -LiteralPath $ZipPath -Destination $AliasZipPath -Force
 
           $Sha = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
           $SumsPath = Join-Path $env:RUNNER_TEMP "SHA256SUMS.txt"
-          Set-Content -Path $SumsPath -Value "$Sha  $ZipName" -Encoding ASCII
+          $SumsBody = "$Sha  $ZipName`n$Sha  PdfCraft-Portable.zip`n"
+          [System.IO.File]::WriteAllText($SumsPath, $SumsBody, [System.Text.Encoding]::ASCII)
 
           "ZIP_PATH=$ZipPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ALIAS_ZIP_PATH=$AliasZipPath" | Out-File -FilePath $env:GITHUB_ENV -Append
           "SUMS_PATH=$SumsPath" | Out-File -FilePath $env:GITHUB_ENV -Append
           "RELEASE_VER=$Ver" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Publish Combined GitHub Release
-        if: env.SKIP_BUILD != 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $Tag = $env:TARGET_TAG
-          $Notes = "Merged official upstream `storytold/pdfcraft` **$Tag** with **Enterprise Multi-Printer Cluster Engine** (simultaneous multi-printer dispatch, true K-only monochrome, hardware margin auto-fit, pre-flight capability checks, zero-copy `SharedPdfSource`, failover rerouting, and diagnostic telemetry).`n`nUpstream changelog: https://github.com/storytold/pdfcraft/releases/tag/$Tag"
+          $Notes = "Merged official upstream ``storytold/pdfcraft`` **$Tag** with **Enterprise Multi-Printer Cluster Engine** (simultaneous multi-printer dispatch, true K-only monochrome, hardware margin auto-fit, pre-flight capability checks, zero-copy ``SharedPdfSource``, one-click failover rerouting, and diagnostic telemetry).`n`n### Included in Full Portable Package:`n- ``pdfcraft.exe`` (Desktop GUI + Multi-Printer Engine + Auto-Updater)`n- ``pdfcraft-cli.exe`` (Command-Line Tool)`n- ``models/`` (Offline OCR Models, SHA-256 Verified)`n- ``portable.txt`` & ``update_channel.json`` & ``README-AR.txt```n`nUpstream changelog: https://github.com/storytold/pdfcraft/releases/tag/$Tag"
           $Exists = gh release view $Tag --json tagName 2>$null
           if ($Exists) {
-            gh release upload $Tag "$env:ZIP_PATH" "$env:SUMS_PATH" --clobber
+            gh release upload $Tag "$env:ZIP_PATH" "$env:ALIAS_ZIP_PATH" "$env:SUMS_PATH" --clobber
           } else {
-            gh release create $Tag "$env:ZIP_PATH" "$env:SUMS_PATH" --title "PdfCraft $env:RELEASE_VER (Enterprise Multi-Printer)" --notes "$Notes"
+            gh release create $Tag "$env:ZIP_PATH" "$env:ALIAS_ZIP_PATH" "$env:SUMS_PATH" --title "PdfCraft $env:RELEASE_VER (Enterprise Multi-Printer Full Package)" --notes "$Notes"
           }

@@ -1,29 +1,79 @@
 ﻿<#
 .SYNOPSIS
-    PdfCraft Enterprise Multi-Printer Edition — Conflict-Free Upstream Sync & Builder
+    PdfCraft Enterprise Multi-Printer Edition — Conflict-Free Upstream Sync & Full Package Builder
 .DESCRIPTION
     Fetches the latest updates/releases from the official upstream channel
     (https://github.com/storytold/pdfcraft.git), merges them cleanly on top of our
     isolated Enterprise Multi-Printer modules, verifies architectural layer rules,
-    builds the release binary, and packages the Portable distribution with SHA-256 checksums.
+    builds the full release binaries (pdfcraft.exe + pdfcraft-cli.exe), fetches SHA-256-verified
+    offline OCR models (cargo xtask models), and packages the complete POSIX-compliant Portable
+    distribution with SHA256SUMS.txt configured for ahrrfy/smart-print-.
 
     Can be run directly by the developer/admin:
         powershell -ExecutionPolicy Bypass -File .\scripts\sync-upstream.ps1
     Or invoked headlessly by PdfCraft's built-in Update Manager ("Update and Restart"):
-        powershell -ExecutionPolicy Bypass -File .\scripts\sync-upstream.ps1 -TargetRef v0.22.0 -StageZipPath C:\...\update.zip
+        powershell -ExecutionPolicy Bypass -File .\scripts\sync-upstream.ps1 -TargetRef v0.22.0 -StageZipPath C:\...\update.zip -SkipTests
 #>
 param(
     [string]$TargetRef = "upstream/main",
     [string]$StageZipPath = "",
+    [string]$CustomRepo = "ahrrfy/smart-print-",
     [switch]$SkipTests
 )
 
 $ErrorActionPreference = "Stop"
 
+function New-PosixPortableZip {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceDir,
+        [Parameter(Mandatory = $true)][string]$ZipFilePath,
+        [Parameter(Mandatory = $true)][string]$WrapperFolderName,
+        [string[]]$ExcludeNames = @("PdfCraftData")
+    )
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    if (Test-Path -LiteralPath $ZipFilePath) {
+        Remove-Item -LiteralPath $ZipFilePath -Force
+    }
+    $Parent = Split-Path -Parent $ZipFilePath
+    if ($Parent -and !(Test-Path -LiteralPath $Parent)) {
+        New-Item -ItemType Directory -Path $Parent -Force | Out-Null
+    }
+
+    $ResolvedSource = (Resolve-Path -LiteralPath $SourceDir).Path.TrimEnd('\', '/')
+    $Fs = [System.IO.File]::Open($ZipFilePath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        $Archive = New-Object System.IO.Compression.ZipArchive($Fs, [System.IO.Compression.ZipArchiveMode]::Create, $false)
+        try {
+            $AllFiles = Get-ChildItem -LiteralPath $ResolvedSource -Recurse -File
+            foreach ($File in $AllFiles) {
+                $Rel = $File.FullName.Substring($ResolvedSource.Length).TrimStart('\', '/')
+                $TopSeg = ($Rel -split '[\\/]')[0]
+                if ($ExcludeNames -contains $TopSeg) {
+                    continue
+                }
+                # Enforce forward slashes ('/') so craft_update::portable::unpack_over accepts every nested entry
+                $EntryName = ($WrapperFolderName + "/" + ($Rel -replace '\\', '/'))
+                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $Archive,
+                    $File.FullName,
+                    $EntryName,
+                    [System.IO.Compression.CompressionLevel]::Optimal
+                ) | Out-Null
+            }
+        } finally {
+            $Archive.Dispose()
+        }
+    } finally {
+        $Fs.Dispose()
+    }
+}
+
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location -Path $RepoRoot
 
-Write-Host "=== [1/5] Preparing Upstream Channel (storytold/pdfcraft) ===" -ForegroundColor Cyan
+Write-Host "=== [1/6] Preparing Upstream Channel (storytold/pdfcraft) ===" -ForegroundColor Cyan
 $UpstreamUrl = "https://github.com/storytold/pdfcraft.git"
 $Remotes = git remote
 if ($Remotes -notcontains "upstream") {
@@ -34,22 +84,18 @@ if ($Remotes -notcontains "upstream") {
 
 git fetch upstream --tags --prune
 
-# Ensure git identity exists for automated merge commits
 $GitName = git config user.name
 if ([string]::IsNullOrWhiteSpace($GitName)) {
     git config user.name "PdfCraft Enterprise Sync"
     git config user.email "sync@pdfcraft.local"
 }
 
-# Resolve target ref: if a tag like v0.21.1 was requested and upstream/main already contains it,
-# merge upstream/main (or the exact tag if preferred) cleanly.
 $MergeTarget = $TargetRef
 git rev-parse --verify $MergeTarget *> $null
 if ($LASTEXITCODE -ne 0) {
     throw "Upstream reference '$MergeTarget' was not found after fetching $UpstreamUrl."
 }
 
-$HeadSha = (git rev-parse HEAD).Trim()
 $TargetSha = (git rev-parse $MergeTarget).Trim()
 
 $Stashed = $false
@@ -65,7 +111,7 @@ try {
     if ($LASTEXITCODE -eq 0) {
         Write-Host "Already up to date with $MergeTarget ($TargetSha)." -ForegroundColor Green
     } else {
-        Write-Host "=== [2/5] Merging $MergeTarget into Custom Enterprise Branch ===" -ForegroundColor Cyan
+        Write-Host "=== [2/6] Merging $MergeTarget into Custom Enterprise Branch ===" -ForegroundColor Cyan
         git merge $MergeTarget --no-edit -m "chore(sync): merge upstream $MergeTarget into Enterprise Multi-Printer Edition"
         if ($LASTEXITCODE -ne 0) {
             git merge --abort
@@ -93,7 +139,6 @@ if ($RepoRoot -match "[^\x00-\x7F]") {
     }
 }
 
-# Configure local Rust / MinGW toolchain paths if installed in user profile
 $UserCargo = Join-Path $env:USERPROFILE ".cargo\bin"
 $UserW64 = Join-Path $env:USERPROFILE "w64devkit\bin"
 $UserW64Libexec = Join-Path $env:USERPROFILE "w64devkit\libexec\gcc\x86_64-w64-mingw32\16.2.0"
@@ -114,83 +159,117 @@ if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR) -and ($RepoRoot -match "
 
 Set-Location -Path $BuildWorkDir
 
-Write-Host "=== [3/5] Verifying Architecture Layer Boundaries (xtask layers) ===" -ForegroundColor Cyan
+Write-Host "=== [3/6] Verifying Architecture Layer Boundaries (xtask layers) ===" -ForegroundColor Cyan
 cargo run -p xtask -- layers
 if ($LASTEXITCODE -ne 0) {
     throw "xtask layers check failed after upstream sync."
 }
 
 if (-not $SkipTests -and [string]::IsNullOrWhiteSpace($StageZipPath)) {
-    Write-Host "=== [3b/5] Running Core Print & Coordinator Regression Tests ===" -ForegroundColor Cyan
+    Write-Host "=== [3b/6] Running Core Print & Custom Update Regression Tests ===" -ForegroundColor Cyan
     cargo test -p pdfcraft-print --lib
     if ($LASTEXITCODE -ne 0) { throw "pdfcraft-print unit tests failed." }
+    cargo test -p pdfcraft-ui-egui --lib platform::custom_update
+    if ($LASTEXITCODE -ne 0) { throw "pdfcraft-ui-egui custom_update tests failed." }
 }
 
-Write-Host "=== [4/5] Building Combined Release Binary (Upstream + Multi-Printer) ===" -ForegroundColor Cyan
-cargo build --release -p pdfcraft
+Write-Host "=== [4/6] Building Full Release Binaries (pdfcraft.exe + pdfcraft-cli.exe) ===" -ForegroundColor Cyan
+cargo build --release -p pdfcraft -p pdfcraft-cli
 if ($LASTEXITCODE -ne 0) {
     throw "Release build failed."
 }
 
 $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $BuildWorkDir "target" }
 $BuiltExe = Join-Path $TargetDir "release\pdfcraft.exe"
-if (!(Test-Path $BuiltExe)) {
-    throw "Compiled binary not found at $BuiltExe"
+$BuiltCli = Join-Path $TargetDir "release\pdfcraft-cli.exe"
+if (!(Test-Path $BuiltExe) -or !(Test-Path $BuiltCli)) {
+    throw "Compiled binaries not found in $TargetDir\release"
 }
 
 $VersionOutput = (& $BuiltExe --version | Out-String).Trim()
 $VersionNumber = ($VersionOutput -replace "^pdfcraft\s+", "").Split(" ")[0]
 Write-Host "Built version: $VersionOutput" -ForegroundColor Green
 
-Write-Host "=== [5/5] Packaging Portable Distribution ===" -ForegroundColor Cyan
-if (![string]::IsNullOrWhiteSpace($StageZipPath)) {
-    $StageParent = Split-Path -Parent $StageZipPath
-    if ($StageParent -and !(Test-Path $StageParent)) {
-        New-Item -ItemType Directory -Path $StageParent -Force | Out-Null
+Write-Host "=== [5/6] Staging SHA-256-Verified Offline OCR Models (cargo xtask models) ===" -ForegroundColor Cyan
+$ModelsCacheDir = Join-Path $TargetDir "models-stage"
+New-Item -ItemType Directory -Path $ModelsCacheDir -Force | Out-Null
+cargo run -p xtask -- models $ModelsCacheDir
+if ($LASTEXITCODE -ne 0) {
+    throw "cargo xtask models failed."
+}
+Remove-Item -Force (Join-Path $ModelsCacheDir "*.part") -ErrorAction SilentlyContinue
+
+function Populate-PortableFolder([string]$DestFolder) {
+    New-Item -ItemType Directory -Path $DestFolder -Force | Out-Null
+    Copy-Item -LiteralPath $BuiltExe -Destination (Join-Path $DestFolder "pdfcraft.exe") -Force -ErrorAction Stop
+    Copy-Item -LiteralPath $BuiltCli -Destination (Join-Path $DestFolder "pdfcraft-cli.exe") -Force -ErrorAction Stop
+
+    $DestModels = Join-Path $DestFolder "models"
+    New-Item -ItemType Directory -Path $DestModels -Force | Out-Null
+    Copy-Item -Path (Join-Path $ModelsCacheDir "*") -Destination $DestModels -Recurse -Force
+
+    $OfficialPortableTxt = Join-Path $RepoRoot "packaging\windows\portable.txt"
+    if (Test-Path -LiteralPath $OfficialPortableTxt) {
+        Copy-Item -LiteralPath $OfficialPortableTxt -Destination (Join-Path $DestFolder "portable.txt") -Force
+    } else {
+        Set-Content -LiteralPath (Join-Path $DestFolder "portable.txt") -Value "Portable mode marker - settings stored in PdfCraftData" -Encoding UTF8
     }
-    $TempPackDir = Join-Path ([System.IO.Path]::GetTempPath()) ("pdfcraft-stage-" + [System.Guid]::NewGuid().ToString("N"))
-    $InnerDir = Join-Path $TempPackDir "pdfcraft-$VersionNumber-windows-x64-portable"
-    New-Item -ItemType Directory -Path $InnerDir -Force | Out-Null
-    Copy-Item -Path $BuiltExe -Destination (Join-Path $InnerDir "pdfcraft.exe") -Force
-    Set-Content -Path (Join-Path $InnerDir "portable.txt") -Value "Portable mode marker - settings stored in PdfCraftData" -Encoding UTF8
-    if (Test-Path $StageZipPath) { Remove-Item -Path $StageZipPath -Force }
-    Compress-Archive -Path $InnerDir -DestinationPath $StageZipPath -Force
-    Remove-Item -Path $TempPackDir -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Host "Staged portable update ZIP at: $StageZipPath" -ForegroundColor Green
+
+    $ArGuide = Join-Path $RepoRoot "docs\PORTABLE-README-AR.txt"
+    if (Test-Path -LiteralPath $ArGuide) {
+        Copy-Item -LiteralPath $ArGuide -Destination (Join-Path $DestFolder "README-AR.txt") -Force
+    }
+
+    foreach ($DocFile in @("README.md", "NOTICE", "LICENSE-MIT", "LICENSE-APACHE")) {
+        $DocSrc = Join-Path $RepoRoot $DocFile
+        if (Test-Path -LiteralPath $DocSrc) {
+            Copy-Item -LiteralPath $DocSrc -Destination (Join-Path $DestFolder $DocFile) -Force
+        }
+    }
+    $IconLic = Join-Path $RepoRoot "assets\app-icon\LICENSE-document.txt"
+    if (Test-Path -LiteralPath $IconLic) {
+        Copy-Item -LiteralPath $IconLic -Destination (Join-Path $DestFolder "LICENSE-document.txt") -Force
+    }
+
+    $ChannelJson = [ordered]@{
+        upstream_repo = "storytold/pdfcraft"
+        custom_repo   = $CustomRepo
+    } | ConvertTo-Json -Depth 3
+    Set-Content -LiteralPath (Join-Path $DestFolder "update_channel.json") -Value $ChannelJson -Encoding UTF8
 }
 
-# Always keep dist\PdfCraft-Portable up to date as well when not locked by a running instance
+$WrapperStem = "pdfcraft-$VersionNumber-windows-x64-portable"
+
+Write-Host "=== [6/6] Packaging Full Portable Distribution ===" -ForegroundColor Cyan
+if (![string]::IsNullOrWhiteSpace($StageZipPath)) {
+    $TempPackDir = Join-Path ([System.IO.Path]::GetTempPath()) ("pdfcraft-stage-" + [System.Guid]::NewGuid().ToString("N"))
+    try {
+        Populate-PortableFolder -DestFolder $TempPackDir
+        New-PosixPortableZip -SourceDir $TempPackDir -ZipFilePath $StageZipPath -WrapperFolderName $WrapperStem
+        Write-Host "Staged full portable update ZIP at: $StageZipPath" -ForegroundColor Green
+    } finally {
+        Remove-Item -LiteralPath $TempPackDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $DistDir = Join-Path $RepoRoot "dist"
 $PortableDir = Join-Path $DistDir "PdfCraft-Portable"
-New-Item -ItemType Directory -Path $PortableDir -Force | Out-Null
 
 try {
-    Copy-Item -Path $BuiltExe -Destination (Join-Path $PortableDir "pdfcraft.exe") -Force -ErrorAction Stop
-    if (!(Test-Path (Join-Path $PortableDir "portable.txt"))) {
-        Set-Content -Path (Join-Path $PortableDir "portable.txt") -Value "Portable mode marker - settings stored in PdfCraftData" -Encoding UTF8
-    }
-    $ChannelConfigPath = Join-Path $PortableDir "update_channel.json"
-    if (!(Test-Path $ChannelConfigPath)) {
-        $DefaultChannel = @{
-            upstream_repo    = "storytold/pdfcraft"
-            custom_repo      = ""
-            source_workspace = $RepoRoot
-        } | ConvertTo-Json -Depth 4
-        Set-Content -Path $ChannelConfigPath -Value $DefaultChannel -Encoding UTF8
-    }
+    Populate-PortableFolder -DestFolder $PortableDir
     $ZipPath = Join-Path $DistDir "PdfCraft-Portable.zip"
-    $VersionedZip = Join-Path $DistDir "pdfcraft-$VersionNumber-windows-x64-portable.zip"
-    if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
-    if (Test-Path $VersionedZip) { Remove-Item $VersionedZip -Force }
-    # Exclude runtime user data/cache (PdfCraftData) from distributable ZIP archives
-    $CleanItems = Get-ChildItem -Path $PortableDir | Where-Object { $_.Name -ne "PdfCraftData" } | Select-Object -ExpandProperty FullName
-    Compress-Archive -Path $CleanItems -DestinationPath $ZipPath -Force
-    Copy-Item -Path $ZipPath -Destination $VersionedZip -Force
+    $VersionedZip = Join-Path $DistDir "$WrapperStem.zip"
 
-    $Hash = (Get-FileHash -Path $VersionedZip -Algorithm SHA256).Hash.ToLowerInvariant()
-    $SumsLine = "$Hash  pdfcraft-$VersionNumber-windows-x64-portable.zip"
-    Set-Content -Path (Join-Path $DistDir "SHA256SUMS.txt") -Value $SumsLine -Encoding ASCII
-    Write-Host "Updated $PortableDir and $VersionedZip (SHA-256: $Hash)" -ForegroundColor Green
+    New-PosixPortableZip -SourceDir $PortableDir -ZipFilePath $VersionedZip -WrapperFolderName $WrapperStem -ExcludeNames @("PdfCraftData")
+    Copy-Item -LiteralPath $VersionedZip -Destination $ZipPath -Force
+
+    $Hash = (Get-FileHash -LiteralPath $VersionedZip -Algorithm SHA256).Hash.ToLowerInvariant()
+    $SumsLines = @(
+        "$Hash  $WrapperStem.zip",
+        "$Hash  PdfCraft-Portable.zip"
+    ) -join "`n"
+    [System.IO.File]::WriteAllText((Join-Path $DistDir "SHA256SUMS.txt"), ($SumsLines + "`n"), [System.Text.Encoding]::ASCII)
+    Write-Host "Updated $PortableDir, $VersionedZip, and PdfCraft-Portable.zip (SHA-256: $Hash)" -ForegroundColor Green
 } catch {
     if ([string]::IsNullOrWhiteSpace($StageZipPath)) {
         throw $_
