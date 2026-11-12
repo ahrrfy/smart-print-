@@ -85,6 +85,54 @@ jobs:
           git merge-base --is-ancestor "$env:TARGET_TAG" HEAD
           if ($LASTEXITCODE -ne 0) {
             git merge "$env:TARGET_TAG" --no-edit -m "chore(sync): merge official upstream $env:TARGET_TAG into Enterprise Multi-Printer Edition"
+            if ($LASTEXITCODE -ne 0) {
+              $Unmerged = @(git diff --name-only --diff-filter=U | Where-Object { ![string]::IsNullOrWhiteSpace($_) })
+              $OnlyVersionFiles = ($Unmerged.Count -gt 0) -and (($Unmerged | Where-Object { $_ -notin @("Cargo.toml", "Cargo.lock") }).Count -eq 0)
+              $Resolved = $false
+              if ($OnlyVersionFiles) {
+                $CanResolveToml = $true
+                if ($Unmerged -contains "Cargo.toml") {
+                  $RawToml = [System.IO.File]::ReadAllText("Cargo.toml")
+                  $ConflictPattern = '(?ms)^<<<<<<< [^\r\n]*\r?\n(.*?)^=======\r?\n(.*?)^>>>>>>> [^\r\n]*\r?\n?'
+                  $MatchesList = [regex]::Matches($RawToml, $ConflictPattern)
+                  $VerLinePattern = '^\s*version\s*=\s*"(\d+\.\d+\.\d+)"\s*$'
+                  if ($MatchesList.Count -eq 0) { $CanResolveToml = $false }
+                  foreach ($M in $MatchesList) {
+                    if (($M.Groups[1].Value.TrimEnd("`r", "`n") -notmatch $VerLinePattern) -or ($M.Groups[2].Value.TrimEnd("`r", "`n") -notmatch $VerLinePattern)) {
+                      $CanResolveToml = $false
+                    }
+                  }
+                  if ($CanResolveToml) {
+                    $ResolvedToml = [regex]::Replace($RawToml, $ConflictPattern, {
+                      param($Match)
+                      $OursLine = $Match.Groups[1].Value.TrimEnd("`r", "`n")
+                      $TheirsLine = $Match.Groups[2].Value.TrimEnd("`r", "`n")
+                      $OursVer = [version]([regex]::Match($OursLine, '"(\d+\.\d+\.\d+)"').Groups[1].Value)
+                      $TheirsVer = [version]([regex]::Match($TheirsLine, '"(\d+\.\d+\.\d+)"').Groups[1].Value)
+                      $NL = if ($Match.Value.Contains("`r`n")) { "`r`n" } else { "`n" }
+                      if ($TheirsVer -ge $OursVer) { return ($TheirsLine + $NL) } else { return ($OursLine + $NL) }
+                    })
+                    [System.IO.File]::WriteAllText("Cargo.toml", $ResolvedToml, (New-Object System.Text.UTF8Encoding($false)))
+                    git add Cargo.toml
+                  }
+                }
+                if ($CanResolveToml) {
+                  if ($Unmerged -contains "Cargo.lock") {
+                    git checkout --theirs Cargo.lock
+                  }
+                  cargo metadata --format-version 1 *> $null
+                  if ($LASTEXITCODE -eq 0) {
+                    git add Cargo.lock
+                    git commit --no-edit -m "chore(sync): merge official upstream $env:TARGET_TAG into Enterprise Multi-Printer Edition (SemVer max)"
+                    if ($LASTEXITCODE -eq 0) { $Resolved = $true }
+                  }
+                }
+              }
+              if (-not $Resolved) {
+                git merge --abort
+                throw "Automatic merge encountered a non-version conflict with $env:TARGET_TAG."
+              }
+            }
             git push origin HEAD:main
           }
           git push origin "HEAD:refs/tags/$env:TARGET_TAG" --force

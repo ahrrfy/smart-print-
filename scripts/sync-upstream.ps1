@@ -106,6 +106,76 @@ if (![string]::IsNullOrWhiteSpace($DirtyStatus)) {
     $Stashed = $true
 }
 
+function Resolve-VersionOnlyMergeConflicts {
+    $LocalCargo = Join-Path $env:USERPROFILE ".cargo\bin\cargo.exe"
+    $CargoExe = if (Test-Path $LocalCargo) { $LocalCargo } else { "cargo" }
+
+    $PrevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $Unmerged = @(git diff --name-only --diff-filter=U | Where-Object { ![string]::IsNullOrWhiteSpace($_) })
+        if ($Unmerged.Count -eq 0) {
+            return $false
+        }
+        foreach ($Path in $Unmerged) {
+            if ($Path -notin @("Cargo.toml", "Cargo.lock")) {
+                return $false
+            }
+        }
+
+        if ($Unmerged -contains "Cargo.toml") {
+            $RawToml = [System.IO.File]::ReadAllText((Join-Path $RepoRoot "Cargo.toml"))
+            $ConflictPattern = '(?ms)^<<<<<<< [^\r\n]*\r?\n(.*?)^=======\r?\n(.*?)^>>>>>>> [^\r\n]*\r?\n?'
+            $MatchesList = [regex]::Matches($RawToml, $ConflictPattern)
+            if ($MatchesList.Count -eq 0) {
+                return $false
+            }
+            $VerLinePattern = '^\s*version\s*=\s*"(\d+\.\d+\.\d+)"\s*$'
+            foreach ($M in $MatchesList) {
+                $OursBlock = $M.Groups[1].Value.TrimEnd("`r", "`n")
+                $TheirsBlock = $M.Groups[2].Value.TrimEnd("`r", "`n")
+                if (($OursBlock -notmatch $VerLinePattern) -or ($TheirsBlock -notmatch $VerLinePattern)) {
+                    return $false
+                }
+            }
+            $ResolvedToml = [regex]::Replace($RawToml, $ConflictPattern, {
+                param($Match)
+                $OursLine = $Match.Groups[1].Value.TrimEnd("`r", "`n")
+                $TheirsLine = $Match.Groups[2].Value.TrimEnd("`r", "`n")
+                $OursVer = [version]([regex]::Match($OursLine, '"(\d+\.\d+\.\d+)"').Groups[1].Value)
+                $TheirsVer = [version]([regex]::Match($TheirsLine, '"(\d+\.\d+\.\d+)"').Groups[1].Value)
+                $NewLine = if ($Match.Value.Contains("`r`n")) { "`r`n" } else { "`n" }
+                if ($TheirsVer -ge $OursVer) {
+                    return ($TheirsLine + $NewLine)
+                } else {
+                    return ($OursLine + $NewLine)
+                }
+            })
+            [System.IO.File]::WriteAllText((Join-Path $RepoRoot "Cargo.toml"), $ResolvedToml, (New-Object System.Text.UTF8Encoding($false)))
+            git add Cargo.toml
+        }
+
+        if ($Unmerged -contains "Cargo.lock") {
+            git checkout --theirs Cargo.lock 2>&1 | Out-Null
+            & $CargoExe metadata --format-version 1 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                return $false
+            }
+            git add Cargo.lock
+        } elseif (Test-Path (Join-Path $RepoRoot "Cargo.lock")) {
+            & $CargoExe metadata --format-version 1 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                git add Cargo.lock
+            }
+        }
+
+        $Remaining = @(git diff --name-only --diff-filter=U | Where-Object { ![string]::IsNullOrWhiteSpace($_) })
+        return ($Remaining.Count -eq 0)
+    } finally {
+        $ErrorActionPreference = $PrevEap
+    }
+}
+
 try {
     git merge-base --is-ancestor $TargetSha HEAD
     if ($LASTEXITCODE -eq 0) {
@@ -114,10 +184,20 @@ try {
         Write-Host "=== [2/6] Merging $MergeTarget into Custom Enterprise Branch ===" -ForegroundColor Cyan
         git merge $MergeTarget --no-edit -m "chore(sync): merge upstream $MergeTarget into Enterprise Multi-Printer Edition"
         if ($LASTEXITCODE -ne 0) {
-            git merge --abort
-            throw "Automatic merge encountered a conflict with $MergeTarget. Merge was safely aborted so no files were harmed."
+            if (Resolve-VersionOnlyMergeConflicts) {
+                git commit --no-edit -m "chore(sync): merge upstream $MergeTarget into Enterprise Multi-Printer Edition (SemVer max)"
+                if ($LASTEXITCODE -ne 0) {
+                    git merge --abort
+                    throw "Failed to finalize automatic version-conflict merge with $MergeTarget."
+                }
+                Write-Host "Automatically resolved Cargo.toml/Cargo.lock version conflict using SemVer max!" -ForegroundColor Green
+            } else {
+                git merge --abort
+                throw "Automatic merge encountered a conflict with $MergeTarget. Merge was safely aborted so no files were harmed."
+            }
+        } else {
+            Write-Host "Successfully merged $MergeTarget without conflicts!" -ForegroundColor Green
         }
-        Write-Host "Successfully merged $MergeTarget without conflicts!" -ForegroundColor Green
     }
 } finally {
     if ($Stashed) {
